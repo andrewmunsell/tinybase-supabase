@@ -477,6 +477,16 @@ integrationDescribe('CRDT update RLS', () => {
 			).error,
 		).not.toBeNull();
 		expect(
+			(
+				await owner.client.from('crdt_document_updates').insert({
+					created_at: '2000-01-01T00:00:00.000Z',
+					document_id: documentId,
+					id: crypto.randomUUID(),
+					update: '\\x0001',
+				})
+			).error,
+		).not.toBeNull();
+		expect(
 			(await owner.client.from('crdt_document_updates').delete().eq('id', updateId)).error,
 		).not.toBeNull();
 

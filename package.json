@@ -1,6 +1,6 @@
 {
 	"name": "tinybase-supabase",
-	"version": "0.1.0",
+	"version": "0.2.0",
 	"description": "Browser-only offline-first TinyBase persistence and Supabase synchronization.",
 	"license": "MIT",
 	"type": "module",
@@ -17,6 +17,7 @@
 	"files": [
 		"dist",
 		"README.md",
+		"CHANGELOG.md",
 		"LICENSE"
 	],
 	"sideEffects": false,

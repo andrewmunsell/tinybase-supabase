@@ -499,7 +499,11 @@ export const createCrdtCoordinator = async (
 			started = true;
 			syncGeneration += 1;
 			for (const open of [...documents.values()]) {
-				await subscribe(open);
+				try {
+					await subscribe(open);
+				} catch (error) {
+					reportError(error);
+				}
 			}
 			await scheduleBufferedUpdates();
 		},

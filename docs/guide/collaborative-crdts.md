@@ -40,6 +40,7 @@ const persister = await createSupabasePersister(store, {
 });
 
 await persister.startAutoPersisting();
+// The ordinary parent row must already exist in TinyBase before it can be opened.
 const document = await persister.openRow('documents', documentId);
 document.getText('body').insert(0, 'Collaborative text');
 document.getArray('blocks').push([{type: 'paragraph'}]);
@@ -69,10 +70,11 @@ later safety synchronization.
 
 Locally cached Yjs updates can be opened and edited when an authoritative pull
 fails transiently; the shared scheduler reports the offline state and retries.
-Permanent authorization failures still reject `openRow`. For a full page reload
-to work without a network connection, the application must also precache its
-JavaScript assets, including any bundler chunk containing the optional CRDT
-implementation, as part of its normal offline/PWA setup.
+Explicit authorization errors reject `openRow`, while RLS-filtered empty results
+cannot revoke data already cached locally; see the operational gotchas below.
+For a full page reload to work without a network connection, the application
+must also precache its JavaScript assets, including any bundler chunk containing
+the optional CRDT implementation, as part of its normal offline/PWA setup.
 
 ## Required Supabase tables
 
@@ -102,7 +104,8 @@ create index document_yjs_updates_document_order_idx
 
 alter table public.document_yjs_updates enable row level security;
 revoke all on public.document_yjs_updates from anon, authenticated;
-grant select, insert on public.document_yjs_updates to authenticated;
+grant select on public.document_yjs_updates to authenticated;
+grant insert (id, document_id, update) on public.document_yjs_updates to authenticated;
 alter publication supabase_realtime add table public.document_yjs_updates;
 ```
 
@@ -191,6 +194,35 @@ recursive RLS between parent and membership policies. Set an empty
 inside the function, and grant only `execute` to the roles that need it. Do not
 accept an arbitrary user ID from the caller.
 
-Revoking access cannot erase data already cached on a device, but it prevents
-future reads and inserts. RLS is enforced on authoritative pulls and writes;
-Realtime is only a wake-up signal.
+## Operational gotchas
+
+- Use one active persister for each `databaseName` and `scopeKey` in a browser
+  storage partition. The IndexedDB outboxes do not use a cross-tab leader lock;
+  concurrent instances sharing the same database can create equivalent upload
+  envelopes and report stale pending counts. Coordinate tabs at the application
+  layer or give intentionally isolated instances different database names.
+- Call `row.destroy()` or `persister.closeRow(tableId, rowId)` when a document is
+  unmounted or deleted. `persister.destroy()` closes every remaining row.
+  Closing releases the Y.Doc and its row-filtered Realtime channel.
+- Prefer `retryRejected()` for rejected CRDT updates. Later Yjs updates can
+  causally depend on an earlier rejected update; discarding that predecessor can
+  leave later server updates permanently pending and diverged from the optimistic
+  local document. Use `discardRejected()` only when the application will also
+  abandon or reset the affected local CRDT state.
+- Grant updates-table `insert` only to users trusted to submit valid Yjs binary
+  updates. An authorized client can bypass this package and insert malformed or
+  excessively large `bytea`, causing hydration failures or resource exhaustion.
+  Applications with untrusted writers should validate and rate-limit updates in
+  a controlled server endpoint instead of granting direct table inserts.
+- RLS commonly hides unauthorized rows by returning an empty result rather than
+  an error. Revoking access cannot erase CRDT content already cached on a device,
+  and a cached row may remain locally readable. Revocation prevents future
+  authoritative reads and inserts; rejected local writes remain visible through
+  `getRejectedOperations()`.
+- The 500 ms buffer reduces new rows but is not historical compaction. Already
+  promoted or uploaded envelopes retain stable IDs for retry safety and are not
+  merged again. Long-running deployments still need a separate future retention
+  or snapshot strategy if full-history replay becomes too large.
+
+RLS is enforced on authoritative pulls and writes; Realtime is only a wake-up
+signal.
