@@ -9,6 +9,10 @@ Collaborative cells are configured on the same table mapping with `crdtCells`,
 ordinary whole-row path. See [Collaborative CRDT cells](./collaborative-crdts)
 for the complete update-table and RLS contract.
 
+`crdtUpdateBufferMs` configures how long local Yjs updates are collected and
+merged per row before upload. It defaults to `500`; set it to `0` for immediate
+upload. Local durability is not delayed.
+
 ```ts
 tables: {
 	projects: {

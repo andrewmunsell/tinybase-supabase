@@ -115,7 +115,10 @@ export const createHybridPersister = async (
 			await coordinator?.stopSyncing();
 			await standard.stopSyncing();
 		},
-		syncNow: () => scheduler.runNow(),
+		async syncNow(): Promise<void> {
+			await coordinator?.flushBufferedUpdates();
+			await scheduler.runNow();
+		},
 	}) as SupabasePersister;
 	return result;
 };

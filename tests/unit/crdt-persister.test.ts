@@ -162,6 +162,7 @@ const waitForSyncPhase = async (
 };
 
 const configuration = (client: MemorySupabase, databaseName: string) => ({
+	crdtUpdateBufferMs: 0,
 	databaseName,
 	pollIntervalMs: 0,
 	scopeKey: 'user',
@@ -261,6 +262,137 @@ describe('createSupabasePersister with CRDT cells', () => {
 		await row.destroy();
 		expect(store.hasCell('documents', 'doc-1', 'body')).toBe(false);
 		await persister.destroy();
+	});
+
+	it('buffers and merges local updates into one automatic upload per document', async () => {
+		const client = new MemorySupabase();
+		client.rows.set('documents', [{ id: 'doc-1', owner_id: 'user' }]);
+		const store = createStore().setRow('documents', 'doc-1', { owner_id: 'user' });
+		const persister = await createSupabasePersister(store, {
+			...configuration(client, `buffered-${crypto.randomUUID()}`),
+			crdtUpdateBufferMs: 20,
+		});
+		await persister.startSyncing();
+		const row = await persister.openRow('documents', 'doc-1');
+
+		row.getText('body').insert(0, 'a');
+		row.getText('body').insert(1, 'b');
+		row.getText('body').insert(2, 'c');
+		await tick();
+		expect(persister.getSyncStatus().pendingCount).toBe(3);
+		expect(client.rows.get('document_yjs_updates')).toHaveLength(0);
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		expect(client.rows.get('document_yjs_updates')).toHaveLength(0);
+		await new Promise((resolve) => setTimeout(resolve, 30));
+
+		expect(client.rows.get('document_yjs_updates')).toHaveLength(1);
+		expect(persister.getSyncStatus().pendingCount).toBe(0);
+		const receiverStore = createStore().setRow('documents', 'doc-1', { owner_id: 'user' });
+		const receiver = await createSupabasePersister(
+			receiverStore,
+			configuration(client, `buffered-receiver-${crypto.randomUUID()}`),
+		);
+		await receiver.openRow('documents', 'doc-1');
+		expect(receiverStore.getCell('documents', 'doc-1', 'body')).toBe('abc');
+		await receiver.destroy();
+		await persister.destroy();
+	});
+
+	it('uses a 500ms update buffer by default', async () => {
+		const client = new MemorySupabase();
+		client.rows.set('documents', [{ id: 'doc-1', owner_id: 'user' }]);
+		const store = createStore().setRow('documents', 'doc-1', { owner_id: 'user' });
+		const { crdtUpdateBufferMs: _crdtUpdateBufferMs, ...defaultConfiguration } = configuration(
+			client,
+			`default-buffer-${crypto.randomUUID()}`,
+		);
+		const persister = await createSupabasePersister(store, defaultConfiguration);
+		await persister.startSyncing();
+		const row = await persister.openRow('documents', 'doc-1');
+		row.getText('body').insert(0, 'default');
+		await tick();
+
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		expect(client.rows.get('document_yjs_updates')).toHaveLength(0);
+		await new Promise((resolve) => setTimeout(resolve, 450));
+		expect(client.rows.get('document_yjs_updates')).toHaveLength(1);
+		await persister.destroy();
+	});
+
+	it('compacts each document independently within the shared buffer window', async () => {
+		const client = new MemorySupabase();
+		client.rows.set('documents', [
+			{ id: 'doc-1', owner_id: 'user' },
+			{ id: 'doc-2', owner_id: 'user' },
+		]);
+		const store = createStore()
+			.setRow('documents', 'doc-1', { owner_id: 'user' })
+			.setRow('documents', 'doc-2', { owner_id: 'user' });
+		const persister = await createSupabasePersister(store, {
+			...configuration(client, `multi-buffer-${crypto.randomUUID()}`),
+			crdtUpdateBufferMs: 20,
+		});
+		await persister.startSyncing();
+		const first = await persister.openRow('documents', 'doc-1');
+		const second = await persister.openRow('documents', 'doc-2');
+
+		first.getText('body').insert(0, 'one');
+		first.getMap<string>('properties').set('source', 'first');
+		second.getText('body').insert(0, 'two');
+		second.getArray<string>('items').push(['second']);
+		await new Promise((resolve) => setTimeout(resolve, 40));
+
+		const updates = client.rows.get('document_yjs_updates') ?? [];
+		expect(updates).toHaveLength(2);
+		expect(updates.map(({ document_id }) => document_id).sort()).toEqual(['doc-1', 'doc-2']);
+		await persister.destroy();
+	});
+
+	it('forces buffered updates through syncNow without waiting for the window', async () => {
+		const client = new MemorySupabase();
+		client.rows.set('documents', [{ id: 'doc-1', owner_id: 'user' }]);
+		const store = createStore().setRow('documents', 'doc-1', { owner_id: 'user' });
+		const persister = await createSupabasePersister(store, {
+			...configuration(client, `forced-buffer-${crypto.randomUUID()}`),
+			crdtUpdateBufferMs: 10_000,
+		});
+		const row = await persister.openRow('documents', 'doc-1');
+		row.getText('body').insert(0, 'first');
+		row.getText('body').insert(5, ' second');
+
+		await persister.syncNow();
+		expect(client.rows.get('document_yjs_updates')).toHaveLength(1);
+		await persister.destroy();
+	});
+
+	it('recovers and compacts a durable buffer after recreation', async () => {
+		const client = new MemorySupabase();
+		client.rows.set('documents', [{ id: 'doc-1', owner_id: 'user' }]);
+		const databaseName = `durable-buffer-${crypto.randomUUID()}`;
+		const firstStore = createStore().setRow('documents', 'doc-1', { owner_id: 'user' });
+		const first = await createSupabasePersister(firstStore, {
+			...configuration(client, databaseName),
+			crdtUpdateBufferMs: 10_000,
+		});
+		const firstRow = await first.openRow('documents', 'doc-1');
+		firstRow.getText('body').insert(0, 'durable');
+		firstRow.getText('body').insert(7, ' buffer');
+		await tick();
+		await first.destroy();
+		expect(client.rows.get('document_yjs_updates')).toHaveLength(0);
+
+		const secondStore = createStore().setRow('documents', 'doc-1', { owner_id: 'user' });
+		const second = await createSupabasePersister(secondStore, {
+			...configuration(client, databaseName),
+			crdtUpdateBufferMs: 10_000,
+		});
+		await second.openRow('documents', 'doc-1');
+		expect(secondStore.getCell('documents', 'doc-1', 'body')).toBe('durable buffer');
+		await second.syncNow();
+
+		expect(client.rows.get('document_yjs_updates')).toHaveLength(1);
+		expect(second.getSyncStatus().pendingCount).toBe(0);
+		await second.destroy();
 	});
 
 	it('deduplicates concurrent row opens and removes a failed open from lifecycle state', async () => {
@@ -646,6 +778,9 @@ describe('createSupabasePersister with CRDT cells', () => {
 			status: 403,
 		});
 		row.getText('body').insert(0, 'Rejected');
+		row.getText('body').insert(8, ' update');
+		row.getMap<string>('properties').set('state', 'rejected');
+		row.getArray<string>('items').push(['pending']);
 		await tick();
 		await persister.syncNow();
 		await expect(persister.getRejectedOperations()).resolves.toEqual([
