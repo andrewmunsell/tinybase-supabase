@@ -1,7 +1,7 @@
-import { packageName } from '../src/index.js';
+import { createSupabasePersister } from '../src/index.js';
 
 describe('package surface', () => {
-    it('exports its package identity', () => {
-        expect(packageName).toBe('tinybase-supabase');
+    it('exports the persister factory', () => {
+        expect(createSupabasePersister).toBeInstanceOf(Function);
     });
 });

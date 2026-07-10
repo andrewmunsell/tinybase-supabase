@@ -1,7 +1,11 @@
-/**
- * Browser-only offline persistence and Supabase synchronization for TinyBase.
- *
- * The implementation is exported in later commits; this entry point establishes
- * the stable dual-module package surface.
- */
-export const packageName = 'tinybase-supabase';
+export { createSupabasePersister } from './create-supabase-persister.js';
+export type {
+    RealtimeTableConfig,
+    RejectedOperation,
+    SupabasePersister,
+    SupabasePersisterConfig,
+    SupabaseRow,
+    SupabaseTableConfig,
+    SyncPhase,
+    SyncStatus,
+} from './types.js';
