@@ -37,6 +37,7 @@ import {createSupabasePersister} from 'tinybase-supabase';
 const store = createStore();
 const supabase = createClient(import.meta.env.VITE_SUPABASE_URL, import.meta.env.VITE_SUPABASE_KEY);
 const persister = await createSupabasePersister(store, {
+	crdtUpdateBufferMs: 500,
 	databaseName: 'my-app',
 	scopeKey: 'current-user-id',
 	supabase,
@@ -92,6 +93,11 @@ cross-table transactions or exactly-once delivery. Cells explicitly configured
 as Yjs types use append-only CRDT updates and merge concurrent changes within
 their values.
 
+Local Yjs updates are durable immediately, then buffered for 500 ms by default
+and merged per row before upload. Set `crdtUpdateBufferMs` to tune the
+collaboration-latency/row-count tradeoff, or call `syncNow()` to flush the
+current buffer immediately.
+
 With `realtime: true`, Postgres Changes only wakes a debounced authenticated
 pull. CRUD remains the write path, and startup, reconnect, manual, and safety
 pulls remain authoritative. Add opted-in tables to the `supabase_realtime`
@@ -118,8 +124,9 @@ pnpm build
 
 The local fixture covers private authenticated todo data, invalid RLS writes,
 anonymous public data with and without RLS, Realtime and non-Realtime tables,
-and a Chromium browser scenario for offline reload, reconnect, Realtime, and
-two-client server-arrival conflict resolution.
+and Chromium browser scenarios for offline reload, reconnect, Realtime,
+two-client server-arrival conflict resolution, durable CRDT rehydration, and
+concurrent Y.Text convergence.
 
 Formatting is enforced by Biome with four-width tabs, semicolons, single
 quotes, trailing commas, and no internal barrel files.

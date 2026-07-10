@@ -1,5 +1,8 @@
+import 'fake-indexeddb/auto';
+import { openDB } from 'idb';
 import { createStore } from 'tinybase';
 import * as Y from 'yjs';
+import { CrdtLocalState } from '../../src/crdt-storage.js';
 import { decodeBytea, encodeBytea, getProjection } from '../../src/crdt/codec.js';
 import {
 	getConfiguredCrdtTables,
@@ -10,6 +13,31 @@ import { createShadowStoreBridge } from '../../src/crdt/shadow-store.js';
 import { CrdtTransport } from '../../src/crdt/transport.js';
 
 describe('CRDT modules', () => {
+	it('upgrades existing CRDT IndexedDB state with a durable buffer store', async () => {
+		const databaseName = `buffer-upgrade-${crypto.randomUUID()}`;
+		const database = await openDB(`${databaseName}:user:yjs`, 1, {
+			upgrade(upgradeDatabase) {
+				const updates = upgradeDatabase.createObjectStore('updates');
+				updates.createIndex('documentKey', 'documentKey');
+				upgradeDatabase.createObjectStore('outbox');
+				upgradeDatabase.createObjectStore('rejected');
+			},
+		});
+		database.close();
+
+		const state = await CrdtLocalState.open(databaseName, 'user');
+		await state.persistLocalUpdate({
+			bufferedAt: Date.now(),
+			documentKey: 'documents\0doc-1',
+			id: 'update-1',
+			rowId: 'doc-1',
+			tableId: 'documents',
+			update: Uint8Array.from([1, 2]),
+		});
+		await expect(state.getBuffered()).resolves.toHaveLength(1);
+		state.close();
+	});
+
 	it('round trips Supabase bytea values', () => {
 		const update = Uint8Array.from([0, 1, 127, 255]);
 		expect(encodeBytea(update)).toBe('\\x00017fff');

@@ -21,6 +21,7 @@ belong on the parent row so Postgres can enforce relational integrity and RLS.
 
 ```ts
 const persister = await createSupabasePersister(store, {
+	crdtUpdateBufferMs: 500,
 	databaseName: 'notes',
 	scopeKey: user.id,
 	supabase,
@@ -51,6 +52,15 @@ store.setCell('documents', documentId, 'status', 'published');
 The projected TinyBase cells are read-only. Edit them through the Yjs handles;
 TinyBase receives reactive detached projections: strings for `text`, arrays for
 `array`, and objects for `map`. CRDT cells are absent until `openRow` finishes.
+
+Each local Yjs update is persisted to IndexedDB immediately. The persister then
+collects updates for each row during `crdtUpdateBufferMs` (500 ms by default),
+merges them with `Y.mergeUpdates`, and uploads one append-only update row. The
+window begins with the first buffered update, so continuous editing does not
+postpone synchronization indefinitely. Different documents are compacted
+independently. `syncNow()` flushes the current buffer immediately, and setting
+`crdtUpdateBufferMs: 0` disables the delay while retaining the same durable
+path.
 
 With `realtime` enabled, both parent-row and updates-table notifications feed a
 single debounced reconciliation scheduler. Polling, reconnect, tab visibility,
@@ -106,8 +116,9 @@ The column contract is strict:
 - `created_at` plus `id` provides deterministic pagination. Yjs correctness
   does not depend on application order.
 
-The table is append-only. This version replays the full history and does not
-require snapshots or compaction.
+The table is append-only. Client-side buffering reduces the number of newly
+created rows, but this version still replays the full server history and does
+not require snapshots or server-side compaction.
 
 A configured CRDT type is permanent for that cell name. Changing `text` to
 `map` or `array`, or enabling CRDT for a populated ordinary column, requires an

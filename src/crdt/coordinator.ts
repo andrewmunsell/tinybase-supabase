@@ -1,6 +1,6 @@
 import type { Row, Store } from 'tinybase';
 import * as Y from 'yjs';
-import { CrdtLocalState, type StoredCrdtUpdate } from '../crdt-storage.js';
+import { type BufferedCrdtUpdate, CrdtLocalState, type StoredCrdtUpdate } from '../crdt-storage.js';
 import type { CrdtCellConfig, CrdtRowHandle, RejectedOperation } from '../types.js';
 import { getDocumentKey, getProjection, remoteOrigin } from './codec.js';
 import type { ConfiguredCrdtTable } from './config.js';
@@ -30,6 +30,7 @@ export interface CrdtCoordinator {
 	destroy(): Promise<void>;
 	discardRejected(): Promise<void>;
 	flushOutbox(isRowBlocked: (tableId: string, rowId: string) => Promise<boolean>): Promise<void>;
+	flushBufferedUpdates(): Promise<void>;
 	getPendingCount(): number;
 	getProjection(tableId: string, rowId: string): Row | undefined;
 	getRejected(): Promise<readonly RejectedOperation[]>;
@@ -45,6 +46,7 @@ export interface CrdtCoordinator {
 export const createCrdtCoordinator = async (
 	store: Store,
 	config: {
+		readonly crdtUpdateBufferMs?: number;
 		readonly databaseName: string;
 		readonly onError?: (error: Error) => void;
 		readonly pageSize?: number;
@@ -63,13 +65,74 @@ export const createCrdtCoordinator = async (
 	const pendingSubscriptions = new Map<string, AbortController>();
 	const subscribingDocuments = new Map<string, Promise<OpenDocument>>();
 	const rowGenerations = new Map<string, number>();
+	const updateBufferMs = Math.max(0, config.crdtUpdateBufferMs ?? 500);
 	let destroyed = false;
 	let started = false;
 	let syncGeneration = 0;
-	let pendingCount = (await state.getOutbox()).length;
+	const [initialOutbox, initialBuffer] = await Promise.all([
+		state.getOutbox(),
+		state.getBuffered(),
+	]);
+	let pendingCount = initialOutbox.length + initialBuffer.length;
 	let rejectedCount = (await state.getRejected()).length;
 	const reportError = (error: unknown): void =>
 		config.onError?.(error instanceof Error ? error : new Error(String(error)));
+	const waitForPendingWrites = async (): Promise<void> => {
+		await Promise.all(
+			[...documents.values()].flatMap(({ pendingWrites }) => [...pendingWrites]),
+		);
+	};
+
+	const scheduleBufferedUpdates = async (): Promise<void> => {
+		if (!started) {
+			return;
+		}
+		const buffered = await state.getBuffered();
+		if (buffered.length > 0) {
+			const firstBufferedAt = Math.min(...buffered.map(({ bufferedAt }) => bufferedAt));
+			scheduleSync(Math.max(0, firstBufferedAt + updateBufferMs - Date.now()));
+		}
+	};
+
+	const compactBufferedUpdates = async (force: boolean): Promise<void> => {
+		const buffered = await state.getBuffered();
+		const byDocument = new Map<string, BufferedCrdtUpdate[]>();
+		for (const update of buffered) {
+			const updates = byDocument.get(update.documentKey) ?? [];
+			updates.push(update);
+			byDocument.set(update.documentKey, updates);
+		}
+		const now = Date.now();
+		for (const updates of byDocument.values()) {
+			updates.sort(
+				(first, second) =>
+					first.bufferedAt - second.bufferedAt || first.id.localeCompare(second.id),
+			);
+			const first = updates[0];
+			if (!first || (!force && first.bufferedAt + updateBufferMs > now)) {
+				continue;
+			}
+			const merged: StoredCrdtUpdate = {
+				documentKey: first.documentKey,
+				id: updates.length === 1 ? first.id : crypto.randomUUID(),
+				rowId: first.rowId,
+				tableId: first.tableId,
+				update:
+					updates.length === 1
+						? first.update
+						: Y.mergeUpdates(updates.map(({ update }) => update)),
+			};
+			await state.promoteBuffered(
+				updates.map(({ id }) => id),
+				merged,
+			);
+			pendingCount -= updates.length - 1;
+			if (updates.length > 1) {
+				onStatusChange();
+			}
+		}
+		await scheduleBufferedUpdates();
+	};
 
 	const getOpenProjection = (open: OpenDocument): Row =>
 		Object.fromEntries(
@@ -257,7 +320,8 @@ export const createCrdtCoordinator = async (
 			if (origin === remoteOrigin) {
 				return;
 			}
-			const update: StoredCrdtUpdate = {
+			const update: BufferedCrdtUpdate = {
+				bufferedAt: Date.now(),
 				documentKey: key,
 				id: crypto.randomUUID(),
 				rowId,
@@ -270,7 +334,7 @@ export const createCrdtCoordinator = async (
 				.persistLocalUpdate(update)
 				.then(() => {
 					if (started) {
-						void requestSync().catch(reportError);
+						scheduleSync(Math.max(0, update.bufferedAt + updateBufferMs - Date.now()));
 					}
 				})
 				.catch((error: unknown) => {
@@ -369,6 +433,7 @@ export const createCrdtCoordinator = async (
 			onStatusChange();
 		},
 		async flushOutbox(isRowBlocked) {
+			await compactBufferedUpdates(false);
 			for (const update of await state.getOutbox()) {
 				const table = tables[update.tableId];
 				if (!table) {
@@ -396,6 +461,10 @@ export const createCrdtCoordinator = async (
 					throw error;
 				}
 			}
+		},
+		async flushBufferedUpdates() {
+			await waitForPendingWrites();
+			await compactBufferedUpdates(true);
 		},
 		getPendingCount: () => pendingCount,
 		getProjection(tableId, rowId) {
@@ -432,6 +501,7 @@ export const createCrdtCoordinator = async (
 			for (const open of [...documents.values()]) {
 				await subscribe(open);
 			}
+			await scheduleBufferedUpdates();
 		},
 		async stopSyncing() {
 			started = false;

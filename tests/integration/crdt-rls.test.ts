@@ -83,6 +83,12 @@ integrationDescribe('CRDT update RLS', () => {
 		ownerRow.getMap<string>('properties').set('color', 'blue');
 		await new Promise((resolve) => setTimeout(resolve, 0));
 		await ownerPersister.syncNow();
+		const uploaded = await owner.client
+			.from('crdt_document_updates')
+			.select('id')
+			.eq('document_id', documentId);
+		expect(uploaded.error).toBeNull();
+		expect(uploaded.data).toHaveLength(1);
 
 		const collaboratorStore = createStore();
 		const collaboratorPersister = await createSupabasePersister(collaboratorStore, {

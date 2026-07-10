@@ -8,7 +8,16 @@ export interface StoredCrdtUpdate {
 	readonly update: Uint8Array;
 }
 
+export interface BufferedCrdtUpdate extends StoredCrdtUpdate {
+	readonly bufferedAt: number;
+}
+
 interface CrdtDatabase extends DBSchema {
+	buffered: {
+		key: string;
+		value: BufferedCrdtUpdate;
+		indexes: { documentKey: string };
+	};
 	updates: {
 		key: string;
 		value: StoredCrdtUpdate;
@@ -32,12 +41,18 @@ export class CrdtLocalState {
 	}
 
 	static async open(databaseName: string, scopeKey: string): Promise<CrdtLocalState> {
-		const database = await openDB<CrdtDatabase>(`${databaseName}:${scopeKey}:yjs`, 1, {
-			upgrade(upgradeDatabase) {
-				const updates = upgradeDatabase.createObjectStore('updates');
-				updates.createIndex('documentKey', 'documentKey');
-				upgradeDatabase.createObjectStore('outbox');
-				upgradeDatabase.createObjectStore('rejected');
+		const database = await openDB<CrdtDatabase>(`${databaseName}:${scopeKey}:yjs`, 2, {
+			upgrade(upgradeDatabase, oldVersion) {
+				if (oldVersion < 1) {
+					const updates = upgradeDatabase.createObjectStore('updates');
+					updates.createIndex('documentKey', 'documentKey');
+					upgradeDatabase.createObjectStore('outbox');
+					upgradeDatabase.createObjectStore('rejected');
+				}
+				if (oldVersion < 2) {
+					const buffered = upgradeDatabase.createObjectStore('buffered');
+					buffered.createIndex('documentKey', 'documentKey');
+				}
 			},
 		});
 		return new CrdtLocalState(database);
@@ -51,6 +66,10 @@ export class CrdtLocalState {
 		return this.#database.getAllFromIndex('updates', 'documentKey', documentKey);
 	}
 
+	async getBuffered(): Promise<BufferedCrdtUpdate[]> {
+		return this.#database.getAll('buffered');
+	}
+
 	async getOutbox(): Promise<StoredCrdtUpdate[]> {
 		return this.#database.getAll('outbox');
 	}
@@ -59,10 +78,24 @@ export class CrdtLocalState {
 		return this.#database.getAll('rejected');
 	}
 
-	async persistLocalUpdate(update: StoredCrdtUpdate): Promise<void> {
-		const transaction = this.#database.transaction(['updates', 'outbox'], 'readwrite');
+	async persistLocalUpdate(update: BufferedCrdtUpdate): Promise<void> {
+		const transaction = this.#database.transaction(['updates', 'buffered'], 'readwrite');
 		await transaction.objectStore('updates').put(update, update.id);
-		await transaction.objectStore('outbox').put(update, update.id);
+		await transaction.objectStore('buffered').put(update, update.id);
+		await transaction.done;
+	}
+
+	async promoteBuffered(sourceIds: readonly string[], merged: StoredCrdtUpdate): Promise<void> {
+		const transaction = this.#database.transaction(
+			['updates', 'buffered', 'outbox'],
+			'readwrite',
+		);
+		for (const id of sourceIds) {
+			await transaction.objectStore('updates').delete(id);
+			await transaction.objectStore('buffered').delete(id);
+		}
+		await transaction.objectStore('updates').put(merged, merged.id);
+		await transaction.objectStore('outbox').put(merged, merged.id);
 		await transaction.done;
 	}
 
