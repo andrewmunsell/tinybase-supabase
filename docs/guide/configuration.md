@@ -4,6 +4,11 @@ Each `tables` key is a TinyBase table Id. Its `table` value is the remote
 Supabase table. The default primary key is `id`, and the default tombstone
 column is `deleted_at`.
 
+Collaborative cells are configured on the same table mapping with `crdtCells`,
+`crdtUpdatesTable`, and optionally `crdtRowIdColumn`. Omit `crdtCells` for the
+ordinary whole-row path. See [Collaborative CRDT cells](./collaborative-crdts)
+for the complete update-table and RLS contract.
+
 ```ts
 tables: {
 	projects: {

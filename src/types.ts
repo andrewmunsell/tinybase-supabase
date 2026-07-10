@@ -1,5 +1,6 @@
 import type { Persister } from 'tinybase/persisters';
 import type { Row } from 'tinybase';
+import type * as Y from 'yjs';
 
 export type SupabaseRow = Record<string, unknown>;
 
@@ -32,6 +33,12 @@ export interface SupabaseTableConfig {
 	readonly fromRemote?: (row: SupabaseRow) => readonly [string, Row];
 	/** Enables Postgres Changes as a debounced pull wake-up for this table. */
 	readonly realtime?: boolean | RealtimeTableConfig;
+	/** Optional collaborative Yjs cells. Omit or use an empty object for ordinary tables. */
+	readonly crdtCells?: Readonly<Record<string, CrdtCellConfig>>;
+	/** Append-only Y.Doc updates table. Required when `crdtCells` is non-empty. */
+	readonly crdtUpdatesTable?: string;
+	/** Foreign-key column in the updates table. Defaults to `row_id`. */
+	readonly crdtRowIdColumn?: string;
 }
 
 export interface RealtimeTableConfig {
@@ -74,4 +81,19 @@ export interface SupabasePersister extends Persister {
 	syncNow(): Promise<void>;
 	startSyncing(): Promise<void>;
 	stopSyncing(): Promise<void>;
+	openRow(tableId: string, rowId: string): Promise<CrdtRowHandle>;
+	closeRow(tableId: string, rowId: string): Promise<void>;
+	isRowOpen(tableId: string, rowId: string): boolean;
+}
+
+export type CrdtCellConfig =
+	| { readonly type: 'array' }
+	| { readonly type: 'map' }
+	| { readonly type: 'text' };
+
+export interface CrdtRowHandle {
+	getArray<T = unknown>(cellId: string): Y.Array<T>;
+	getMap<T = unknown>(cellId: string): Y.Map<T>;
+	getText(cellId: string): Y.Text;
+	destroy(): Promise<void>;
 }

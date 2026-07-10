@@ -7,12 +7,14 @@ focus.
 
 ## Conflict rule
 
-Direct Supabase CRUD uses **whole-row, server-arrival last-write-wins**. When
+Ordinary cells synchronized through direct Supabase CRUD use **whole-row,
+server-arrival last-write-wins**. When
 two offline clients change the same row, the write the server accepts last wins;
 the next complete pull brings the other client to that state.
 
-This mode does not provide exactly-once delivery, cross-table transactions, or
-CRDT merge semantics. Use an RPC-backed protocol when those guarantees matter.
+This ordinary mode does not provide exactly-once delivery or cross-table
+transactions. For concurrent changes within selected text, map, or array
+values, configure [collaborative CRDT cells](./collaborative-crdts).
 
 ## Rejected writes
 

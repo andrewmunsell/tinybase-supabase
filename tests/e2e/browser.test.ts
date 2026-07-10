@@ -53,6 +53,27 @@ const waitForTodoTitle = async (page: Page, id: string, title: string): Promise<
 	throw new Error(`Timed out waiting for todo ${id} to have title ${title}`);
 };
 
+const waitForCrdtConvergence = async (first: Page, second: Page, id: string): Promise<string> => {
+	for (let attempt = 0; attempt < 50; attempt += 1) {
+		const [firstText, secondText] = await Promise.all([
+			first.evaluate((documentId) => window.tinybaseSupabaseTest.getCrdtText(documentId), id),
+			second.evaluate(
+				(documentId) => window.tinybaseSupabaseTest.getCrdtText(documentId),
+				id,
+			),
+		]);
+		if (
+			firstText === secondText &&
+			firstText.includes('first') &&
+			firstText.includes('second')
+		) {
+			return firstText;
+		}
+		await new Promise((resolve) => setTimeout(resolve, 100));
+	}
+	throw new Error(`Timed out waiting for CRDT document ${id} to converge`);
+};
+
 e2eDescribe('browser end-to-end synchronization', () => {
 	jest.setTimeout(45_000);
 
@@ -161,6 +182,103 @@ e2eDescribe('browser end-to-end synchronization', () => {
 
 		await page.evaluate(() => window.tinybaseSupabaseTest.destroy());
 		await context.close();
+		await second.page.evaluate(() => window.tinybaseSupabaseTest.destroy());
+		await second.context.close();
+	});
+
+	it('rehydrates CRDT text offline and converges concurrent browser edits', async () => {
+		const email = `browser-crdt-${crypto.randomUUID()}@example.test`;
+		const password = 'correct-horse-battery-staple';
+		const registration = await fetch(`${apiUrl}/auth/v1/signup`, {
+			body: JSON.stringify({ email, password }),
+			headers: { apikey: anonKey as string, 'content-type': 'application/json' },
+			method: 'POST',
+		});
+		expect(registration.ok).toBe(true);
+
+		const first = await createPage();
+		const userId = await first.page.evaluate(
+			({ nextEmail, nextPassword }) =>
+				window.tinybaseSupabaseTest.boot(nextEmail, nextPassword),
+			{ nextEmail: email, nextPassword: password },
+		);
+		const documentId = `browser-document-${crypto.randomUUID()}`;
+		await first.page.evaluate(
+			({ id, ownerId }) => window.tinybaseSupabaseTest.createCrdtDocument(id, ownerId),
+			{ id: documentId, ownerId: userId },
+		);
+		await first.page.evaluate(
+			(id) => window.tinybaseSupabaseTest.openCrdtDocument(id),
+			documentId,
+		);
+		await first.page.evaluate(
+			(id) => window.tinybaseSupabaseTest.editCrdtText(id, 'initial'),
+			documentId,
+		);
+		await first.page.evaluate(() => window.tinybaseSupabaseTest.sync());
+
+		await first.page.reload();
+		await first.page.evaluate(
+			({ nextEmail, nextPassword }) =>
+				window.tinybaseSupabaseTest.boot(nextEmail, nextPassword),
+			{ nextEmail: email, nextPassword: password },
+		);
+		await first.context.setOffline(true);
+		await first.page.evaluate(() => window.tinybaseSupabaseTest.restartPersister());
+		await first.page.evaluate(
+			(id) => window.tinybaseSupabaseTest.openCrdtDocument(id),
+			documentId,
+		);
+		expect(
+			await first.page.evaluate(
+				(id) => window.tinybaseSupabaseTest.getCrdtText(id),
+				documentId,
+			),
+		).toBe('initial');
+		await first.page.evaluate(
+			(id) => window.tinybaseSupabaseTest.editCrdtText(id, ' offline'),
+			documentId,
+		);
+		await first.context.setOffline(false);
+		await first.page.evaluate(() => window.tinybaseSupabaseTest.sync());
+
+		const second = await createPage();
+		await second.page.evaluate(
+			({ nextEmail, nextPassword }) =>
+				window.tinybaseSupabaseTest.boot(nextEmail, nextPassword),
+			{ nextEmail: email, nextPassword: password },
+		);
+		await second.page.evaluate(
+			(id) => window.tinybaseSupabaseTest.openCrdtDocument(id),
+			documentId,
+		);
+		expect(
+			await second.page.evaluate(
+				(id) => window.tinybaseSupabaseTest.getCrdtText(id),
+				documentId,
+			),
+		).toBe('initial offline');
+
+		await Promise.all([first.context.setOffline(true), second.context.setOffline(true)]);
+		await Promise.all([
+			first.page.evaluate(
+				(id) => window.tinybaseSupabaseTest.editCrdtText(id, ' first'),
+				documentId,
+			),
+			second.page.evaluate(
+				(id) => window.tinybaseSupabaseTest.editCrdtText(id, ' second'),
+				documentId,
+			),
+		]);
+		await Promise.all([first.context.setOffline(false), second.context.setOffline(false)]);
+		await first.page.evaluate(() => window.tinybaseSupabaseTest.sync());
+		await second.page.evaluate(() => window.tinybaseSupabaseTest.sync());
+		await first.page.evaluate(() => window.tinybaseSupabaseTest.sync());
+		const converged = await waitForCrdtConvergence(first.page, second.page, documentId);
+		expect(converged).toContain('initial offline');
+
+		await first.page.evaluate(() => window.tinybaseSupabaseTest.destroy());
+		await first.context.close();
 		await second.page.evaluate(() => window.tinybaseSupabaseTest.destroy());
 		await second.context.close();
 	});
