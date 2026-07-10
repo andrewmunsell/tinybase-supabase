@@ -28,6 +28,7 @@ export default defineConfig({
 				items: [
 					{ link: '/guide/getting-started', text: 'Getting started' },
 					{ link: '/guide/configuration', text: 'Configuration' },
+					{ link: '/guide/collaborative-crdts', text: 'Collaborative CRDT cells' },
 					{ link: '/guide/offline-and-conflicts', text: 'Offline and conflicts' },
 					{ link: '/guide/supabase-and-rls', text: 'Supabase and RLS' },
 					{ link: '/guide/realtime', text: 'Realtime' },

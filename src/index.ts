@@ -1,5 +1,7 @@
 export { createSupabasePersister } from './create-supabase-persister.js';
 export type {
+	CrdtCellConfig,
+	CrdtRowHandle,
 	RealtimeTableConfig,
 	RejectedOperation,
 	SupabasePersister,

@@ -9,6 +9,14 @@ It supports both ESM and CommonJS consumers, direct Supabase CRUD, RLS, soft
 deletes, optional Realtime wake-and-reconcile subscriptions, and local-only or
 read-only TinyBase tables.
 
+The same `createSupabasePersister` factory optionally supports collaborative
+`text`, `map`, and `array` cells. When configured, it stores append-only Yjs
+updates in a child table while keeping IDs, ownership, relationships, and other
+RLS fields on the ordinary parent row. Configurations with no CRDT cells use
+only the ordinary whole-row implementation and require no updates table. See the
+[collaborative CRDT guide](docs/guide/collaborative-crdts.md) for the required
+schema and many-to-one and many-to-many policy examples.
+
 ## Documentation
 
 The versioned source for the documentation and interactive Todo example lives in
@@ -79,9 +87,10 @@ Transient failures retry with capped exponential backoff. Sync also runs on
 browser reconnect and when a hidden tab becomes visible, in addition to the
 optional periodic safety pull.
 
-Direct CRUD uses server-arrival, full-row last-write-wins. It does not promise
-cross-table transactions, exactly-once delivery, or CRDT merge semantics.
-Use an RPC-backed design when those guarantees are required.
+Ordinary cells use server-arrival, full-row last-write-wins. They do not promise
+cross-table transactions or exactly-once delivery. Cells explicitly configured
+as Yjs types use append-only CRDT updates and merge concurrent changes within
+their values.
 
 With `realtime: true`, Postgres Changes only wakes a debounced authenticated
 pull. CRUD remains the write path, and startup, reconnect, manual, and safety
