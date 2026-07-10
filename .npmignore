@@ -1,0 +1,4 @@
+tests/
+supabase/
+.github/
+*.test.ts
