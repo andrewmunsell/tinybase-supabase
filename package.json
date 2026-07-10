@@ -28,6 +28,9 @@
 		"build": "tsup",
 		"changeset": "changeset",
 		"check": "pnpm run format:check && pnpm run lint && pnpm run typecheck",
+		"docs:build": "vitepress build docs",
+		"docs:dev": "vitepress dev docs",
+		"docs:preview": "vitepress preview docs",
 		"format": "biome format --write .",
 		"format:check": "biome format .",
 		"lint": "biome lint .",
@@ -60,7 +63,9 @@
 		"ts-jest": "^29.4.5",
 		"tsup": "^8.5.1",
 		"typescript": "^5.9.3",
-		"vite": "^7.3.1"
+		"vite": "^7.3.1",
+		"vitepress": "^1.6.4",
+		"vue": "^3.5.0"
 	},
 	"keywords": [
 		"tinybase",

@@ -9,6 +9,12 @@ It supports both ESM and CommonJS consumers, direct Supabase CRUD, RLS, soft
 deletes, optional Realtime wake-and-reconcile subscriptions, and local-only or
 read-only TinyBase tables.
 
+## Documentation
+
+The versioned source for the documentation and interactive Todo example lives in
+[`docs/`](docs/). GitHub Actions builds it on every pull request and publishes
+the `main` branch to [GitHub Pages](https://andrewmunsell.github.io/tinybase-supabase/).
+
 ## Installation
 
 ```sh

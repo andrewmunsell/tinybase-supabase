@@ -34,6 +34,7 @@ jobs:
       - run: pnpm exec playwright install --with-deps chromium
       - run: pnpm test:e2e
       - run: pnpm build
+      - run: pnpm docs:build
       - run: pnpm pack --pack-destination .artifacts
       - if: always()
         run: supabase stop --no-backup
