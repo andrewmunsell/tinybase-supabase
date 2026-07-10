@@ -149,5 +149,6 @@ on public.crdt_document_updates for insert to authenticated
 with check (public.can_write_crdt_document(document_id));
 
 revoke all on public.crdt_document_updates from anon, authenticated;
-grant select, insert on public.crdt_document_updates to authenticated;
+grant select on public.crdt_document_updates to authenticated;
+grant insert (id, document_id, update) on public.crdt_document_updates to authenticated;
 alter publication supabase_realtime add table public.crdt_document_updates;

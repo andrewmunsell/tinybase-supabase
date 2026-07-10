@@ -68,6 +68,7 @@ class MemorySupabase {
 	readonly errors = new Map<string, RemoteError>();
 	readonly selectErrors = new Map<string, RemoteError>();
 	readonly subscriptionCallbacks = new Map<string, Array<(status: string) => void>>();
+	readonly subscriptionStatuses = new Map<string, string>();
 	onSubscribe?: (record: (typeof this.channels)[number]) => void;
 
 	channel(name: string) {
@@ -91,7 +92,11 @@ class MemorySupabase {
 						return;
 					}
 				}
-				callback?.('SUBSCRIBED');
+				callback?.(
+					record
+						? (this.subscriptionStatuses.get(record.filter.table) ?? 'SUBSCRIBED')
+						: 'SUBSCRIBED',
+				);
 			},
 		};
 		return channel;
@@ -620,6 +625,40 @@ describe('createSupabasePersister with CRDT cells', () => {
 		await persister.destroy();
 	});
 
+	it('starts ordinary syncing and retries when CRDT realtime startup fails', async () => {
+		const client = new MemorySupabase();
+		client.rows.set('documents', [{ id: 'doc-1', owner_id: 'user' }]);
+		client.subscriptionStatuses.set('document_yjs_updates', 'CHANNEL_ERROR');
+		const store = createStore().setRow('documents', 'doc-1', { owner_id: 'user' });
+		const errors: Error[] = [];
+		const persister = await createSupabasePersister(store, {
+			...configuration(client, `startup-retry-${crypto.randomUUID()}`),
+			onError: (error) => errors.push(error),
+			tables: {
+				documents: {
+					...configuration(client, 'unused').tables.documents,
+					realtime: true,
+				},
+			},
+		});
+		await persister.openRow('documents', 'doc-1');
+
+		await expect(persister.startSyncing()).resolves.toBeUndefined();
+		expect(errors.some(({ message }) => message.includes('CHANNEL_ERROR'))).toBe(true);
+		expect(
+			client.channels.some(({ active, filter }) => active && filter.table === 'documents'),
+		).toBe(true);
+
+		client.subscriptionStatuses.delete('document_yjs_updates');
+		await persister.syncNow();
+		expect(
+			client.channels.some(
+				({ active, filter }) => active && filter.table === 'document_yjs_updates',
+			),
+		).toBe(true);
+		await persister.destroy();
+	});
+
 	it('removes a CRDT channel that finishes subscribing after syncing stops', async () => {
 		const client = new MemorySupabase();
 		client.delayedSubscriptionTables.add('document_yjs_updates');
@@ -792,5 +831,39 @@ describe('createSupabasePersister with CRDT cells', () => {
 		await expect(persister.getRejectedOperations()).resolves.toEqual([]);
 		expect(client.rows.get('document_yjs_updates')).toHaveLength(1);
 		await persister.destroy();
+	});
+
+	it('converges dependent updates after a rejected predecessor is retried', async () => {
+		const client = new MemorySupabase();
+		client.rows.set('documents', [{ id: 'doc-1', owner_id: 'user' }]);
+		client.errors.set('document_yjs_updates', { message: 'forbidden', status: 403 });
+		const senderStore = createStore().setRow('documents', 'doc-1', { owner_id: 'user' });
+		const sender = await createSupabasePersister(
+			senderStore,
+			configuration(client, `dependent-sender-${crypto.randomUUID()}`),
+		);
+		const senderRow = await sender.openRow('documents', 'doc-1');
+		senderRow.getText('body').insert(0, 'A');
+		await sender.syncNow();
+		await expect(sender.getRejectedOperations()).resolves.toHaveLength(1);
+
+		client.errors.delete('document_yjs_updates');
+		senderRow.getText('body').insert(1, 'B');
+		await sender.syncNow();
+		expect(client.rows.get('document_yjs_updates')).toHaveLength(1);
+
+		const receiverStore = createStore().setRow('documents', 'doc-1', { owner_id: 'user' });
+		const receiver = await createSupabasePersister(
+			receiverStore,
+			configuration(client, `dependent-receiver-${crypto.randomUUID()}`),
+		);
+		await receiver.openRow('documents', 'doc-1');
+		expect(receiverStore.getCell('documents', 'doc-1', 'body')).toBe('');
+
+		await sender.retryRejected();
+		await receiver.syncNow();
+		expect(receiverStore.getCell('documents', 'doc-1', 'body')).toBe('AB');
+		await receiver.destroy();
+		await sender.destroy();
 	});
 });
