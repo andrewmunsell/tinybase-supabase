@@ -8,6 +8,7 @@ class MemorySupabase {
 	readonly channels: Array<{ callback: () => void; table: string }> = [];
 	readonly rows = new Map<string, Map<string, RemoteRow>>();
 	permanentError: { message: string; status: number } | undefined;
+	transientError: { message: string; status: number } | undefined;
 
 	from(table: string) {
 		const rows = this.rows.get(table) ?? new Map<string, RemoteRow>();
@@ -23,6 +24,9 @@ class MemorySupabase {
 			upsert: async (payload: RemoteRow) => {
 				if (this.permanentError) {
 					return { data: null, error: this.permanentError };
+				}
+				if (this.transientError) {
+					return { data: null, error: this.transientError };
 				}
 				rows.set(String(payload.id), payload);
 				return { data: null, error: null };
@@ -161,6 +165,29 @@ describe('createSupabasePersister', () => {
 		await new Promise((resolve) => setTimeout(resolve, 250));
 
 		expect(store.getRow('todos', 'remote-1')).toEqual({ completed: true, title: 'Remote' });
+		await persister.destroy();
+	});
+
+	it('retries transient failed writes with exponential backoff', async () => {
+		const client = new MemorySupabase();
+		const store = createStore();
+		const persister = await createSupabasePersister(store, {
+			...configuration(client, crypto.randomUUID()),
+			retryBaseDelayMs: 5,
+			retryMaxDelayMs: 5,
+		});
+		await persister.startAutoPersisting();
+		client.transientError = { message: 'network unavailable', status: 503 };
+
+		store.setRow('todos', 'retry', { title: 'Retry me' });
+		await persister.save();
+		await persister.syncNow();
+		expect(persister.getSyncStatus().pendingCount).toBe(1);
+
+		client.transientError = undefined;
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		expect(client.rows.get('todos')?.get('retry')).toMatchObject({ title: 'Retry me' });
+
 		await persister.destroy();
 	});
 });

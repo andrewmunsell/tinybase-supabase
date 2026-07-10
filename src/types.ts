@@ -51,6 +51,10 @@ export interface SupabasePersisterConfig {
 	readonly pollIntervalMs?: number;
 	/** Maximum rows fetched per Supabase page. Defaults to 500. */
 	readonly pageSize?: number;
+	/** Initial retry delay after a transient network failure. Defaults to 1 second. */
+	readonly retryBaseDelayMs?: number;
+	/** Maximum retry delay after repeated transient failures. Defaults to 30 seconds. */
+	readonly retryMaxDelayMs?: number;
 	/** Called for ignored persistence, realtime, and synchronization errors. */
 	readonly onError?: (error: Error) => void;
 }

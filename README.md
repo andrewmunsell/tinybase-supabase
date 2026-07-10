@@ -69,6 +69,10 @@ errors such as RLS rejection are retained as rejected operations; inspect them
 with `getRejectedOperations`, then retry or discard them. Discarding stops
 retries but deliberately does not alter the local optimistic row.
 
+Transient failures retry with capped exponential backoff. Sync also runs on
+browser reconnect and when a hidden tab becomes visible, in addition to the
+optional periodic safety pull.
+
 Direct CRUD uses server-arrival, full-row last-write-wins. It does not promise
 cross-table transactions, exactly-once delivery, or CRDT merge semantics.
 Use an RPC-backed design when those guarantees are required.

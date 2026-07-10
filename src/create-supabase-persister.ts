@@ -49,6 +49,8 @@ interface SupabaseClient {
 
 const defaultPageSize = 500;
 const defaultPollIntervalMs = 60_000;
+const defaultRetryBaseDelayMs = 1_000;
+const defaultRetryMaxDelayMs = 30_000;
 
 const cloneContent = (content: Content): Content => structuredClone(content);
 
@@ -142,6 +144,8 @@ export const createSupabasePersister = async (
 	const state = await LocalState.open(config.databaseName, config.scopeKey);
 	const client = config.supabase as SupabaseClient;
 	const pageSize = config.pageSize ?? defaultPageSize;
+	const retryBaseDelayMs = config.retryBaseDelayMs ?? defaultRetryBaseDelayMs;
+	const retryMaxDelayMs = config.retryMaxDelayMs ?? defaultRetryMaxDelayMs;
 	const tableConfigs = config.tables;
 	let lastContent = (await state.getContent()) ?? store.getContent();
 	let listener: ((content?: Content) => void) | undefined;
@@ -150,6 +154,9 @@ export const createSupabasePersister = async (
 	let syncRequested = false;
 	let hasStartedSyncing = false;
 	let interval: ReturnType<typeof setInterval> | undefined;
+	let retryAttempt = 0;
+	let retryTimer: ReturnType<typeof setTimeout> | undefined;
+	let browserListenersAttached = false;
 	const channels: SupabaseRealtimeChannel[] = [];
 	const realtimeTimers = new Map<string, ReturnType<typeof setTimeout>>();
 	const statusListeners = new Set<(status: SyncStatus) => void>();
@@ -315,6 +322,26 @@ export const createSupabasePersister = async (
 		}
 	};
 
+	const clearRetry = (): void => {
+		if (retryTimer) {
+			clearTimeout(retryTimer);
+			retryTimer = undefined;
+		}
+		retryAttempt = 0;
+	};
+
+	const scheduleRetry = (): void => {
+		if (retryTimer || isDestroyed) {
+			return;
+		}
+		const delay = Math.min(retryBaseDelayMs * 2 ** retryAttempt, retryMaxDelayMs);
+		retryAttempt += 1;
+		retryTimer = setTimeout(() => {
+			retryTimer = undefined;
+			void syncNow();
+		}, delay);
+	};
+
 	const syncNow = (): Promise<void> => {
 		if (isDestroyed) {
 			return Promise.resolve();
@@ -334,11 +361,13 @@ export const createSupabasePersister = async (
 					for (const tableId of Object.keys(tableConfigs)) {
 						await pullTable(tableId);
 					}
+					clearRetry();
 					await setStatus('idle');
 				} catch (error) {
 					const normalized = asError(error);
 					config.onError?.(normalized);
 					await setStatus('offline', normalized);
+					scheduleRetry();
 				}
 			}
 		})().finally(() => {
@@ -389,6 +418,7 @@ export const createSupabasePersister = async (
 
 	const stopSyncing = async (): Promise<void> => {
 		hasStartedSyncing = false;
+		clearRetry();
 		if (interval) {
 			clearInterval(interval);
 			interval = undefined;
@@ -400,6 +430,21 @@ export const createSupabasePersister = async (
 		for (const channel of channels.splice(0)) {
 			await client.removeChannel(channel);
 		}
+		if (browserListenersAttached && typeof window !== 'undefined') {
+			window.removeEventListener('online', triggerBrowserSync);
+			document.removeEventListener('visibilitychange', triggerVisibleSync);
+			browserListenersAttached = false;
+		}
+	};
+
+	const triggerBrowserSync = (): void => {
+		void syncNow();
+	};
+
+	const triggerVisibleSync = (): void => {
+		if (document.visibilityState === 'visible') {
+			void syncNow();
+		}
 	};
 
 	const startSyncing = async (): Promise<void> => {
@@ -408,6 +453,11 @@ export const createSupabasePersister = async (
 		}
 		hasStartedSyncing = true;
 		startRealtime();
+		if (typeof window !== 'undefined') {
+			window.addEventListener('online', triggerBrowserSync);
+			document.addEventListener('visibilitychange', triggerVisibleSync);
+			browserListenersAttached = true;
+		}
 		const pollIntervalMs = config.pollIntervalMs ?? defaultPollIntervalMs;
 		if (pollIntervalMs > 0) {
 			interval = setInterval(() => void syncNow(), pollIntervalMs);
