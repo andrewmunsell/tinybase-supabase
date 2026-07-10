@@ -1,4 +1,7 @@
 # Contributing
 
-Install dependencies with pnpm, then run `pnpm check` and `pnpm test` before
-opening a pull request. Keep changes focused and add tests for behavior.
+Use pnpm and Node 22.14+. Keep changes focused, avoid internal barrel files,
+and add coverage for behavior changes.
+
+Before opening a pull request, run `pnpm check`, `pnpm test:unit`, and the
+local-Supabase integration/e2e suites when the change affects synchronization.

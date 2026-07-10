@@ -29,6 +29,6 @@
 		}
 	],
 	"files": {
-		"includes": ["**", "!dist", "!coverage", "!node_modules", "!pnpm-lock.yaml"]
+		"includes": ["**", "!dist", "!coverage", "!!node_modules", "!pnpm-lock.yaml"]
 	}
 }

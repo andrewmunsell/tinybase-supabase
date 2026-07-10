@@ -1,6 +1,8 @@
 node_modules/
+.pnpm-store/
 dist/
 coverage/
+.artifacts/
 .env
 .env.*
 !.env.example
