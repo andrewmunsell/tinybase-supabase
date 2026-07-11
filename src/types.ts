@@ -91,11 +91,13 @@ export interface SupabasePersister extends Persister {
 export type CrdtCellConfig =
 	| { readonly type: 'array' }
 	| { readonly type: 'map' }
-	| { readonly type: 'text' };
+	| { readonly type: 'text' }
+	| { readonly type: 'xml-fragment' };
 
 export interface CrdtRowHandle {
 	getArray<T = unknown>(cellId: string): Y.Array<T>;
 	getMap<T = unknown>(cellId: string): Y.Map<T>;
 	getText(cellId: string): Y.Text;
+	getXmlFragment(cellId: string): Y.XmlFragment;
 	destroy(): Promise<void>;
 }

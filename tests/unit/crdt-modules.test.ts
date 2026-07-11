@@ -80,9 +80,15 @@ describe('CRDT modules', () => {
 		document.getText('body').insert(0, 'Hello');
 		document.getArray('items').push(['one']);
 		document.getMap('properties').set('color', 'blue');
+		const paragraph = new Y.XmlElement('p');
+		paragraph.insert(0, [new Y.XmlText('Structured')]);
+		document.getXmlFragment('content').insert(0, [paragraph]);
 		expect(getProjection(document, 'body', { type: 'text' })).toBe('Hello');
 		expect(getProjection(document, 'items', { type: 'array' })).toEqual(['one']);
 		expect(getProjection(document, 'properties', { type: 'map' })).toEqual({ color: 'blue' });
+		expect(getProjection(document, 'content', { type: 'xml-fragment' })).toBe(
+			'<p>Structured</p>',
+		);
 		expect(
 			getMetadataRow(
 				{ body: 'projection', owner_id: 'user', status: 'draft' },
