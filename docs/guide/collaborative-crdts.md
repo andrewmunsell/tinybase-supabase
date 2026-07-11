@@ -2,8 +2,8 @@
 
 `createSupabasePersister` supports collaborative edits within selected cells.
 The factory uses one Yjs document per TinyBase row. Configured
-`text`, `map`, and `array` cells are Yjs shared types; every other cell uses the
-ordinary whole-row Supabase synchronization path.
+`text`, `map`, `array`, and `xml-fragment` cells are Yjs shared types; every
+other cell uses the ordinary whole-row Supabase synchronization path.
 
 CRDT support is entirely optional. A table may omit `crdtCells` or set it to an
 empty object. If every table does so, the factory does not create Yjs documents,
@@ -20,6 +20,8 @@ Keep IDs, owners, tenant IDs, foreign keys, and roles out of Yjs. Those fields
 belong on the parent row so Postgres can enforce relational integrity and RLS.
 
 ```ts
+import * as Y from 'yjs';
+
 const persister = await createSupabasePersister(store, {
 	crdtUpdateBufferMs: 500,
 	databaseName: 'notes',
@@ -31,6 +33,7 @@ const persister = await createSupabasePersister(store, {
 				body: {type: 'text'},
 				blocks: {type: 'array'},
 				properties: {type: 'map'},
+				structuredBody: {type: 'xml-fragment'},
 			},
 			crdtRowIdColumn: 'document_id',
 			crdtUpdatesTable: 'document_yjs_updates',
@@ -45,14 +48,20 @@ const document = await persister.openRow('documents', documentId);
 document.getText('body').insert(0, 'Collaborative text');
 document.getArray('blocks').push([{type: 'paragraph'}]);
 document.getMap('properties').set('theme', 'paper');
+const paragraph = new Y.XmlElement('p');
+paragraph.insert(0, [new Y.XmlText('Structured content')]);
+document.getXmlFragment('structuredBody').insert(0, [paragraph]);
 
 // Ordinary metadata still uses TinyBase writes.
 store.setCell('documents', documentId, 'status', 'published');
 ```
 
 The projected TinyBase cells are read-only. Edit them through the Yjs handles;
-TinyBase receives reactive detached projections: strings for `text`, arrays for
-`array`, and objects for `map`. CRDT cells are absent until `openRow` finishes.
+TinyBase receives reactive detached projections: strings for `text`, serialized
+XML strings for `xml-fragment`, arrays for `array`, and objects for `map`. CRDT
+cells are absent until `openRow` finishes. The XML projection is intended for
+reactive display and indexing; make edits through the live `Y.XmlFragment`
+returned by `getXmlFragment`.
 
 Each local Yjs update is persisted to IndexedDB immediately. The persister then
 collects updates for each row during `crdtUpdateBufferMs` (500 ms by default),
@@ -123,11 +132,11 @@ The table is append-only. Client-side buffering reduces the number of newly
 created rows, but this version still replays the full server history and does
 not require snapshots or server-side compaction.
 
-A configured CRDT type is permanent for that cell name. Changing `text` to
-`map` or `array`, or enabling CRDT for a populated ordinary column, requires an
-application migration. Seed the existing value into the corresponding Yjs type
-before removing the ordinary parent column; otherwise the old value will not
-appear in the CRDT projection.
+A configured CRDT type is permanent for that cell name. Changing a configured
+type (`text`, `map`, `array`, or `xml-fragment`), or enabling CRDT for a
+populated ordinary column, requires an application migration. Seed the existing
+value into the corresponding Yjs type before removing the ordinary parent
+column; otherwise the old value will not appear in the CRDT projection.
 
 ## RLS through a many-to-one relationship
 

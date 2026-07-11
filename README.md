@@ -10,10 +10,11 @@ deletes, optional Realtime wake-and-reconcile subscriptions, and local-only or
 read-only TinyBase tables.
 
 The same `createSupabasePersister` factory optionally supports collaborative
-`text`, `map`, and `array` cells. When configured, it stores append-only Yjs
-updates in a child table while keeping IDs, ownership, relationships, and other
-RLS fields on the ordinary parent row. Configurations with no CRDT cells use
-only the ordinary whole-row implementation and require no updates table. See the
+`text`, `map`, `array`, and `xml-fragment` cells. When configured, it stores
+append-only Yjs updates in a child table while keeping IDs, ownership,
+relationships, and other RLS fields on the ordinary parent row. Configurations
+with no CRDT cells use only the ordinary whole-row implementation and require no
+updates table. See the
 [collaborative CRDT guide](docs/guide/collaborative-crdts.md) for the required
 schema and many-to-one and many-to-many policy examples.
 
@@ -92,7 +93,7 @@ Each entry in `tables` supports these options:
 | `toRemote` | `(rowId: string, row: Row) => SupabaseRow` | Identity mapping | Encodes a TinyBase row for Supabase. The configured ID column is added after this function returns. |
 | `fromRemote` | `(row: SupabaseRow) => [string, Row]` | Default column mapping | Decodes a remote row. By default, the ID becomes the TinyBase row ID and the ID and soft-delete columns are omitted from its cells. |
 | `realtime` | `boolean \| RealtimeTableConfig` | `false` | Enables Postgres Changes as a debounced pull wake-up. Use `true` for the defaults or an object for the options below. |
-| `crdtCells` | `Record<string, CrdtCellConfig>` | `{}` | Collaborative cells keyed by TinyBase cell ID. Each value is `{type: 'text'}`, `{type: 'map'}`, or `{type: 'array'}`. |
+| `crdtCells` | `Record<string, CrdtCellConfig>` | `{}` | Collaborative cells keyed by TinyBase cell ID. Each value is `{type: 'text'}`, `{type: 'map'}`, `{type: 'array'}`, or `{type: 'xml-fragment'}`. |
 | `crdtUpdatesTable` | `string` | None | Append-only Yjs updates table. Required when `crdtCells` is non-empty. |
 | `crdtRowIdColumn` | `string` | `'row_id'` | Foreign-key column in `crdtUpdatesTable` that refers to the parent row. |
 
@@ -122,6 +123,7 @@ const persister = await createSupabasePersister(store, {
 			crdtCells: {
 				body: {type: 'text'},
 				metadata: {type: 'map'},
+				structuredBody: {type: 'xml-fragment'},
 				tags: {type: 'array'},
 			},
 			crdtRowIdColumn: 'document_id',

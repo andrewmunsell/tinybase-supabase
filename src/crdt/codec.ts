@@ -30,5 +30,7 @@ export const getProjection = (document: Y.Doc, cellId: string, config: CrdtCellC
 			return document.getMap(cellId).toJSON();
 		case 'text':
 			return document.getText(cellId).toString();
+		case 'xml-fragment':
+			return document.getXmlFragment(cellId).toString();
 	}
 };

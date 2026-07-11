@@ -1,5 +1,6 @@
 import 'fake-indexeddb/auto';
 import { createStore } from 'tinybase';
+import * as Y from 'yjs';
 import { createSupabasePersister } from '../../src/index.js';
 
 type RemoteRow = Record<string, unknown>;
@@ -267,6 +268,53 @@ describe('createSupabasePersister with CRDT cells', () => {
 		await row.destroy();
 		expect(store.hasCell('documents', 'doc-1', 'body')).toBe(false);
 		await persister.destroy();
+	});
+
+	it('synchronizes Yjs XML fragment documents and projects their serialized XML', async () => {
+		const client = new MemorySupabase();
+		client.rows.set('documents', [{ id: 'doc-1', owner_id: 'user' }]);
+		const xmlConfiguration = (databaseName: string) => ({
+			...configuration(client, databaseName),
+			tables: {
+				documents: {
+					...configuration(client, 'unused').tables.documents,
+					crdtCells: { content: { type: 'xml-fragment' as const } },
+				},
+			},
+		});
+		const senderStore = createStore().setRow('documents', 'doc-1', { owner_id: 'user' });
+		const sender = await createSupabasePersister(
+			senderStore,
+			xmlConfiguration(`xml-sender-${crypto.randomUUID()}`),
+		);
+		const senderRow = await sender.openRow('documents', 'doc-1');
+		const paragraph = new Y.XmlElement('p');
+		paragraph.setAttribute('class', 'lead');
+		paragraph.insert(0, [new Y.XmlText('Collaborative XML')]);
+		senderRow.getXmlFragment('content').insert(0, [paragraph]);
+		await tick();
+		await sender.syncNow();
+
+		expect(senderStore.getCell('documents', 'doc-1', 'content')).toBe(
+			'<p class="lead">Collaborative XML</p>',
+		);
+		expect(() => senderRow.getText('content')).toThrow('is xml-fragment, not text');
+
+		const receiverStore = createStore().setRow('documents', 'doc-1', { owner_id: 'user' });
+		const receiver = await createSupabasePersister(
+			receiverStore,
+			xmlConfiguration(`xml-receiver-${crypto.randomUUID()}`),
+		);
+		const receiverRow = await receiver.openRow('documents', 'doc-1');
+		expect(receiverRow.getXmlFragment('content').toString()).toBe(
+			'<p class="lead">Collaborative XML</p>',
+		);
+		expect(receiverStore.getCell('documents', 'doc-1', 'content')).toBe(
+			'<p class="lead">Collaborative XML</p>',
+		);
+
+		await receiver.destroy();
+		await sender.destroy();
 	});
 
 	it('buffers and merges local updates into one automatic upload per document', async () => {

@@ -313,6 +313,10 @@ export const createCrdtCoordinator = async (
 				assertType(cellId, 'text');
 				return document.getText(cellId);
 			},
+			getXmlFragment(cellId: string): Y.XmlFragment {
+				assertType(cellId, 'xml-fragment');
+				return document.getXmlFragment(cellId);
+			},
 		};
 		open = { document, handle, pendingWrites, rowId, tableId };
 		documents.set(key, open);
