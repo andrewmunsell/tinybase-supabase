@@ -61,6 +61,97 @@ CommonJS projects can use the same public API:
 const {createSupabasePersister} = require('tinybase-supabase');
 ```
 
+## Configuration reference
+
+`createSupabasePersister(store, config)` accepts the following top-level
+options:
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `supabase` | Supabase client | Required | A browser client created with a publishable or anon key. Do not use a service-role client. |
+| `databaseName` | `string` | Required | Stable IndexedDB database name for this application. |
+| `scopeKey` | `string` | Required | Stable user or tenant identifier. It isolates one authenticated scope from another in IndexedDB. |
+| `tables` | `Record<string, SupabaseTableConfig>` | Required | Mapped tables, keyed by TinyBase table ID. TinyBase tables omitted from this object remain local-only. |
+| `pollIntervalMs` | `number` | `60000` | Safety-pull interval in milliseconds. Set to `0` to disable interval pulls. |
+| `pageSize` | `number` | `500` | Maximum number of parent rows or CRDT update rows fetched per Supabase page. |
+| `crdtUpdateBufferMs` | `number` | `500` | Time to buffer and merge local Yjs updates per row before upload. Set to `0` for immediate upload; local durability is not delayed. |
+| `retryBaseDelayMs` | `number` | `1000` | Initial delay for exponential retry after a transient synchronization failure. |
+| `retryMaxDelayMs` | `number` | `30000` | Maximum delay between retries after repeated transient failures. |
+| `onError` | `(error: Error) => void` | None | Receives persistence, Realtime, and synchronization errors. |
+
+Each entry in `tables` supports these options:
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `table` | `string` | Required | Remote Supabase table name. The containing object key is the TinyBase table ID. |
+| `mode` | `'read-write' \| 'read-only'` | `'read-write'` | Read-only mappings pull remote rows but never enqueue local writes. |
+| `idColumn` | `string` | `'id'` | Existing remote primary-key column. IDs must be created by the application and are always added to outgoing rows. |
+| `deletedAtColumn` | `string` | `'deleted_at'` | Existing nullable timestamp column used for soft-delete tombstones. |
+| `dependsOn` | `readonly string[]` | `[]` | TinyBase table IDs that must be uploaded before this table. Tombstones are sent in the reverse dependency order. |
+| `select` | `string` | `'*'` | Columns passed to Supabase `select()` during parent-row reconciliation. Include the configured ID and soft-delete columns. |
+| `toRemote` | `(rowId: string, row: Row) => SupabaseRow` | Identity mapping | Encodes a TinyBase row for Supabase. The configured ID column is added after this function returns. |
+| `fromRemote` | `(row: SupabaseRow) => [string, Row]` | Default column mapping | Decodes a remote row. By default, the ID becomes the TinyBase row ID and the ID and soft-delete columns are omitted from its cells. |
+| `realtime` | `boolean \| RealtimeTableConfig` | `false` | Enables Postgres Changes as a debounced pull wake-up. Use `true` for the defaults or an object for the options below. |
+| `crdtCells` | `Record<string, CrdtCellConfig>` | `{}` | Collaborative cells keyed by TinyBase cell ID. Each value is `{type: 'text'}`, `{type: 'map'}`, or `{type: 'array'}`. |
+| `crdtUpdatesTable` | `string` | None | Append-only Yjs updates table. Required when `crdtCells` is non-empty. |
+| `crdtRowIdColumn` | `string` | `'row_id'` | Foreign-key column in `crdtUpdatesTable` that refers to the parent row. |
+
+`realtime: true` uses the defaults below. Pass an object to override either
+option:
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `channelName` | `string` | `'tinybase-supabase:<scopeKey>:<tableId>'` | Supabase Realtime channel name for parent-row changes. CRDT update channels use their own per-row names. |
+| `debounceMs` | `number` | `200` | Delay used to coalesce Realtime notifications before pulling. It applies to both parent-row and CRDT update notifications. |
+
+For example, a configuration using every option can look like this:
+
+```ts
+const persister = await createSupabasePersister(store, {
+	crdtUpdateBufferMs: 250,
+	databaseName: 'my-app',
+	onError: (error) => console.error(error),
+	pageSize: 250,
+	pollIntervalMs: 30_000,
+	retryBaseDelayMs: 500,
+	retryMaxDelayMs: 15_000,
+	scopeKey: user.id,
+	supabase,
+	tables: {
+		documents: {
+			crdtCells: {
+				body: {type: 'text'},
+				metadata: {type: 'map'},
+				tags: {type: 'array'},
+			},
+			crdtRowIdColumn: 'document_id',
+			crdtUpdatesTable: 'document_yjs_updates',
+			deletedAtColumn: 'deleted_at',
+			dependsOn: ['projects'],
+			fromRemote: (row) => [String(row.id), {title: String(row.title)}],
+			idColumn: 'id',
+			mode: 'read-write',
+			realtime: {
+				channelName: `documents:${user.id}`,
+				debounceMs: 100,
+			},
+			select: 'id,title,deleted_at',
+			table: 'documents',
+			toRemote: (_rowId, row) => ({title: row.title}),
+		},
+		projects: {table: 'projects'},
+		publicTemplates: {
+			mode: 'read-only',
+			table: 'public_templates',
+		},
+	},
+});
+```
+
+`crdtCells` cannot be combined with `mode: 'read-only'`. If any collaborative
+cells are configured, provide the update table and policies described in the
+[collaborative CRDT guide](docs/guide/collaborative-crdts.md).
+
 ## Database contract
 
 Every read-write mapping needs an application-created string or UUID primary
