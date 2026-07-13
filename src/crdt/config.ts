@@ -19,9 +19,6 @@ export const getConfiguredCrdtTables = (
 		if (Object.keys(table.crdtCells ?? {}).length === 0) {
 			continue;
 		}
-		if (table.mode === 'read-only') {
-			throw new Error(`Table ${tableId} cannot combine read-only mode with CRDT cells`);
-		}
 		if (!table.crdtUpdatesTable) {
 			throw new Error(`Table ${tableId} configures CRDT cells but no crdtUpdatesTable`);
 		}

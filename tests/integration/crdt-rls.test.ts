@@ -105,18 +105,32 @@ integrationDescribe('CRDT update RLS', () => {
 					},
 					crdtRowIdColumn: 'document_id',
 					crdtUpdatesTable: 'crdt_document_updates',
+					mode: 'read-only',
 					table: 'crdt_documents',
 				},
 			},
 		});
 		await collaboratorPersister.startAutoPersisting();
-		await collaboratorPersister.openRow('crdt_documents', documentId);
+		const collaboratorRow = await collaboratorPersister.openRow('crdt_documents', documentId);
 		expect(collaboratorStore.getRow('crdt_documents', documentId)).toMatchObject({
 			body: 'Shared',
 			items: ['one'],
 			properties: { color: 'blue' },
 			status: 'draft',
 		});
+		expect(() => collaboratorRow.getText('body').insert(0, 'Not uploaded: ')).toThrow(
+			'is read-only',
+		);
+		await collaboratorPersister.syncNow();
+		await expect(collaboratorPersister.getRejectedOperations()).resolves.toEqual([]);
+		expect(
+			(
+				await owner.client
+					.from('crdt_document_updates')
+					.select('id')
+					.eq('document_id', documentId)
+			).data,
+		).toHaveLength(1);
 
 		await ownerPersister.destroy();
 		await collaboratorPersister.destroy();
@@ -373,7 +387,7 @@ integrationDescribe('CRDT update RLS', () => {
 		).toEqual([]);
 	});
 
-	it('retains a durable rejected CRDT update when access is revoked while a row is open', async () => {
+	it('quarantines dependent CRDT updates after access is revoked and retries them together', async () => {
 		const owner = await createAuthenticatedClient();
 		const editor = await createAuthenticatedClient();
 		const documentId = `open-revocation-${crypto.randomUUID()}`;
@@ -430,6 +444,59 @@ integrationDescribe('CRDT update RLS', () => {
 			expect.objectContaining({ rowId: documentId, tableId: 'crdt_documents' }),
 		]);
 		expect(persister.getSyncStatus().rejectedCount).toBe(1);
+		row.getText('body').insert(row.getText('body').length, ' with a successor');
+		await persister.syncNow();
+		expect(
+			(
+				await owner.client
+					.from('crdt_document_updates')
+					.select('id')
+					.eq('document_id', documentId)
+			).data,
+		).toHaveLength(0);
+
+		expect(
+			(
+				await owner.client.from('crdt_document_collaborators').insert({
+					can_write: true,
+					document_id: documentId,
+					user_id: editor.userId,
+				})
+			).error,
+		).toBeNull();
+		await persister.retryRejected();
+		expect(persister.getSyncStatus()).toMatchObject({ pendingCount: 0, rejectedCount: 0 });
+		expect(
+			(
+				await owner.client
+					.from('crdt_document_updates')
+					.select('id')
+					.eq('document_id', documentId)
+			).data,
+		).toHaveLength(1);
+
+		const receiverStore = createStore().setRow('crdt_documents', documentId, {
+			owner_id: owner.userId,
+		});
+		const receiver = await createSupabasePersister(receiverStore, {
+			databaseName: `open-revocation-receiver-${crypto.randomUUID()}`,
+			pollIntervalMs: 0,
+			scopeKey: owner.userId,
+			supabase: owner.client,
+			tables: {
+				crdt_documents: {
+					crdtCells: { body: { type: 'text' } },
+					crdtRowIdColumn: 'document_id',
+					crdtUpdatesTable: 'crdt_document_updates',
+					table: 'crdt_documents',
+				},
+			},
+		});
+		await receiver.openRow('crdt_documents', documentId);
+		expect(receiverStore.getCell('crdt_documents', documentId, 'body')).toBe(
+			'Unsent after revocation with a successor',
+		);
+		await receiver.destroy();
 		await persister.destroy();
 	});
 

@@ -1,6 +1,7 @@
 import 'fake-indexeddb/auto';
 import { createStore } from 'tinybase';
 import * as Y from 'yjs';
+import { CrdtLocalState } from '../../src/crdt-storage.js';
 import { createSupabasePersister } from '../../src/index.js';
 
 type RemoteRow = Record<string, unknown>;
@@ -237,6 +238,181 @@ describe('createSupabasePersister with CRDT cells', () => {
 		});
 		expect(store.getCell('documents', 'doc-1', 'body')).toBe('Hybrid');
 		expect(client.rows.get('document_yjs_updates')).toHaveLength(1);
+		await persister.destroy();
+	});
+
+	it('hydrates and follows CRDT updates without retaining local updates in read-only mode', async () => {
+		const client = new MemorySupabase();
+		client.rows.set('documents', [{ id: 'doc-1', owner_id: 'owner' }]);
+		const writerStore = createStore().setRow('documents', 'doc-1', { owner_id: 'owner' });
+		const writer = await createSupabasePersister(
+			writerStore,
+			configuration(client, `read-only-writer-${crypto.randomUUID()}`),
+		);
+		const writerRow = await writer.openRow('documents', 'doc-1');
+		writerRow.getText('body').insert(0, 'Remote');
+		await tick();
+		await writer.syncNow();
+
+		const databaseName = `read-only-reader-${crypto.randomUUID()}`;
+		const readerStore = createStore().setRow('documents', 'doc-1', { owner_id: 'owner' });
+		const reader = await createSupabasePersister(readerStore, {
+			...configuration(client, databaseName),
+			tables: {
+				documents: {
+					...configuration(client, 'unused').tables.documents,
+					mode: 'read-only',
+					realtime: true,
+				},
+			},
+		});
+		await reader.startSyncing();
+		const readerRow = await reader.openRow('documents', 'doc-1');
+		expect(readerStore.getCell('documents', 'doc-1', 'body')).toBe('Remote');
+
+		writerRow.getText('body').insert(6, ' update');
+		await tick();
+		await writer.syncNow();
+		client.channels
+			.find(({ active, filter }) => active && filter.table === 'document_yjs_updates')
+			?.callback();
+		await new Promise((resolve) => setTimeout(resolve, 250));
+		expect(readerStore.getCell('documents', 'doc-1', 'body')).toBe('Remote update');
+
+		expect(() => readerRow.getText('body').insert(0, 'Local ')).toThrow('is read-only');
+		readerStore.setCell('documents', 'doc-1', 'owner_id', 'local-owner');
+		await reader.save();
+		await reader.syncNow();
+		expect(reader.getSyncStatus().pendingCount).toBe(0);
+		expect(client.rows.get('document_yjs_updates')).toHaveLength(2);
+		expect(client.rows.get('documents')).toEqual([{ id: 'doc-1', owner_id: 'owner' }]);
+
+		const localState = await CrdtLocalState.open(databaseName, 'user');
+		await expect(localState.getBuffered()).resolves.toHaveLength(0);
+		await expect(localState.getOutbox()).resolves.toHaveLength(0);
+		await expect(localState.getDocumentUpdates('documents\0doc-1')).resolves.toHaveLength(2);
+		localState.close();
+		await reader.closeRow('documents', 'doc-1');
+		await reader.openRow('documents', 'doc-1');
+		expect(readerStore.getCell('documents', 'doc-1', 'body')).toBe('Remote update');
+		await reader.destroy();
+		await writer.destroy();
+	});
+
+	it('discards buffered CRDT writes when a table is reopened read-only', async () => {
+		const client = new MemorySupabase();
+		client.rows.set('documents', [{ id: 'doc-1', owner_id: 'owner' }]);
+		const databaseName = `read-only-reopen-${crypto.randomUUID()}`;
+		const writerStore = createStore().setRow('documents', 'doc-1', { owner_id: 'owner' });
+		const writer = await createSupabasePersister(writerStore, {
+			...configuration(client, databaseName),
+			crdtUpdateBufferMs: 10_000,
+		});
+		const writerRow = await writer.openRow('documents', 'doc-1');
+		writerRow.getText('body').insert(0, 'Unsent');
+		await tick();
+		expect(writer.getSyncStatus().pendingCount).toBe(1);
+		await writer.destroy();
+
+		const readerStore = createStore().setRow('documents', 'doc-1', { owner_id: 'owner' });
+		const reader = await createSupabasePersister(readerStore, {
+			...configuration(client, databaseName),
+			tables: {
+				documents: {
+					...configuration(client, 'unused').tables.documents,
+					mode: 'read-only',
+				},
+			},
+		});
+		await reader.openRow('documents', 'doc-1');
+		expect(readerStore.getCell('documents', 'doc-1', 'body')).toBe('');
+		expect(reader.getSyncStatus().pendingCount).toBe(0);
+		await reader.syncNow();
+		expect(client.rows.get('document_yjs_updates')).toHaveLength(0);
+		await reader.destroy();
+	});
+
+	it('removes rejected CRDT content before reopening the table read-only', async () => {
+		const client = new MemorySupabase();
+		client.rows.set('documents', [{ id: 'doc-1', owner_id: 'owner' }]);
+		const databaseName = `read-only-rejected-${crypto.randomUUID()}`;
+		const writerStore = createStore().setRow('documents', 'doc-1', { owner_id: 'owner' });
+		const writer = await createSupabasePersister(
+			writerStore,
+			configuration(client, databaseName),
+		);
+		const writerRow = await writer.openRow('documents', 'doc-1');
+		client.errors.set('document_yjs_updates', { message: 'forbidden', status: 403 });
+		writerRow.getText('body').insert(0, 'Rejected');
+		await tick();
+		await writer.syncNow();
+		await expect(writer.getRejectedOperations()).resolves.toHaveLength(1);
+		await writer.destroy();
+
+		client.errors.delete('document_yjs_updates');
+		const readerStore = createStore().setRow('documents', 'doc-1', { owner_id: 'owner' });
+		const reader = await createSupabasePersister(readerStore, {
+			...configuration(client, databaseName),
+			tables: {
+				documents: {
+					...configuration(client, 'unused').tables.documents,
+					mode: 'read-only',
+				},
+			},
+		});
+		await reader.openRow('documents', 'doc-1');
+
+		expect(readerStore.getCell('documents', 'doc-1', 'body')).toBe('');
+		expect(reader.getSyncStatus()).toMatchObject({ pendingCount: 0, rejectedCount: 0 });
+		await expect(reader.getRejectedOperations()).resolves.toEqual([]);
+		await reader.retryRejected();
+		expect(client.rows.get('document_yjs_updates')).toHaveLength(0);
+		const localState = await CrdtLocalState.open(databaseName, 'user');
+		await expect(localState.getDocumentUpdates('documents\0doc-1')).resolves.toHaveLength(0);
+		localState.close();
+		await reader.destroy();
+	});
+
+	it('rejects local mutations for every CRDT cell type in read-only mode', async () => {
+		const client = new MemorySupabase();
+		client.rows.set('documents', [{ id: 'doc-1', owner_id: 'owner' }]);
+		const databaseName = `read-only-types-${crypto.randomUUID()}`;
+		const store = createStore().setRow('documents', 'doc-1', { owner_id: 'owner' });
+		const persister = await createSupabasePersister(store, {
+			...configuration(client, databaseName),
+			tables: {
+				documents: {
+					...configuration(client, 'unused').tables.documents,
+					crdtCells: {
+						body: { type: 'text' },
+						items: { type: 'array' },
+						properties: { type: 'map' },
+						structuredBody: { type: 'xml-fragment' },
+					},
+					mode: 'read-only',
+				},
+			},
+		});
+		const row = await persister.openRow('documents', 'doc-1');
+
+		expect(() => row.getText('body').insert(0, 'Blocked')).toThrow('is read-only');
+		expect(() => row.getArray('items').push(['blocked'])).toThrow('is read-only');
+		expect(() => row.getMap('properties').set('blocked', true)).toThrow('is read-only');
+		expect(() =>
+			row.getXmlFragment('structuredBody').insert(0, [new Y.XmlElement('blocked')]),
+		).toThrow('is read-only');
+		expect(store.getRow('documents', 'doc-1')).toEqual({
+			body: '',
+			items: [],
+			owner_id: 'owner',
+			properties: {},
+			structuredBody: '',
+		});
+		expect(persister.getSyncStatus()).toMatchObject({ pendingCount: 0, rejectedCount: 0 });
+		const localState = await CrdtLocalState.open(databaseName, 'user');
+		await expect(localState.getDocumentUpdates('documents\0doc-1')).resolves.toHaveLength(0);
+		localState.close();
+
 		await persister.destroy();
 	});
 
@@ -854,11 +1030,9 @@ describe('createSupabasePersister with CRDT cells', () => {
 	it('retains permanent CRDT failures for explicit retry', async () => {
 		const client = new MemorySupabase();
 		client.rows.set('documents', [{ id: 'doc-1', owner_id: 'user' }]);
+		const databaseName = `crdt-rejected-${crypto.randomUUID()}`;
 		const store = createStore().setRow('documents', 'doc-1', { owner_id: 'user' });
-		const persister = await createSupabasePersister(
-			store,
-			configuration(client, `crdt-rejected-${crypto.randomUUID()}`),
-		);
+		const persister = await createSupabasePersister(store, configuration(client, databaseName));
 		const row = await persister.openRow('documents', 'doc-1');
 		client.errors.set('document_yjs_updates', {
 			message: 'new row violates row-level security policy',
@@ -873,11 +1047,23 @@ describe('createSupabasePersister with CRDT cells', () => {
 		await expect(persister.getRejectedOperations()).resolves.toEqual([
 			expect.objectContaining({ rowId: 'doc-1', tableId: 'documents' }),
 		]);
+		const rejectedState = await CrdtLocalState.open(databaseName, 'user');
+		await expect(rejectedState.getQuarantined()).resolves.toEqual([
+			expect.objectContaining({
+				rowId: 'doc-1',
+				state: 'rejected',
+				tableId: 'documents',
+			}),
+		]);
+		rejectedState.close();
 
 		client.errors.delete('document_yjs_updates');
 		await persister.retryRejected();
 		await expect(persister.getRejectedOperations()).resolves.toEqual([]);
 		expect(client.rows.get('document_yjs_updates')).toHaveLength(1);
+		const retriedState = await CrdtLocalState.open(databaseName, 'user');
+		await expect(retriedState.getQuarantined()).resolves.toEqual([]);
+		retriedState.close();
 		await persister.destroy();
 	});
 
@@ -898,7 +1084,7 @@ describe('createSupabasePersister with CRDT cells', () => {
 		client.errors.delete('document_yjs_updates');
 		senderRow.getText('body').insert(1, 'B');
 		await sender.syncNow();
-		expect(client.rows.get('document_yjs_updates')).toHaveLength(1);
+		expect(client.rows.get('document_yjs_updates')).toHaveLength(0);
 
 		const receiverStore = createStore().setRow('documents', 'doc-1', { owner_id: 'user' });
 		const receiver = await createSupabasePersister(
@@ -913,5 +1099,175 @@ describe('createSupabasePersister with CRDT cells', () => {
 		expect(receiverStore.getCell('documents', 'doc-1', 'body')).toBe('AB');
 		await receiver.destroy();
 		await sender.destroy();
+	});
+
+	it('keeps quarantine across restart while retaining optimistic local edits', async () => {
+		const client = new MemorySupabase();
+		client.rows.set('documents', [{ id: 'doc-1', owner_id: 'user' }]);
+		client.errors.set('document_yjs_updates', { message: 'forbidden', status: 403 });
+		const databaseName = `quarantine-restart-${crypto.randomUUID()}`;
+		const firstStore = createStore().setRow('documents', 'doc-1', { owner_id: 'user' });
+		const first = await createSupabasePersister(
+			firstStore,
+			configuration(client, databaseName),
+		);
+		const firstRow = await first.openRow('documents', 'doc-1');
+		firstRow.getText('body').insert(0, 'Rejected');
+		await first.syncNow();
+		firstRow.getText('body').insert(8, ' successor');
+		await first.syncNow();
+		expect(firstStore.getCell('documents', 'doc-1', 'body')).toBe('Rejected successor');
+		expect(client.rows.get('document_yjs_updates')).toHaveLength(0);
+		await first.destroy();
+
+		const secondStore = createStore().setRow('documents', 'doc-1', { owner_id: 'user' });
+		const second = await createSupabasePersister(
+			secondStore,
+			configuration(client, databaseName),
+		);
+		await second.openRow('documents', 'doc-1');
+		expect(secondStore.getCell('documents', 'doc-1', 'body')).toBe('Rejected successor');
+		await second.syncNow();
+		expect(client.rows.get('document_yjs_updates')).toHaveLength(0);
+
+		client.errors.delete('document_yjs_updates');
+		await second.retryRejected();
+		expect(second.getSyncStatus()).toMatchObject({ pendingCount: 0, rejectedCount: 0 });
+		expect(client.rows.get('document_yjs_updates')).toHaveLength(1);
+		await second.destroy();
+	});
+
+	it('keeps a retrying document quarantined across transient failures', async () => {
+		const client = new MemorySupabase();
+		client.rows.set('documents', [{ id: 'doc-1', owner_id: 'user' }]);
+		const databaseName = `quarantine-retry-${crypto.randomUUID()}`;
+		const store = createStore().setRow('documents', 'doc-1', { owner_id: 'user' });
+		const persister = await createSupabasePersister(store, configuration(client, databaseName));
+		const row = await persister.openRow('documents', 'doc-1');
+		client.errors.set('document_yjs_updates', { message: 'forbidden', status: 403 });
+		row.getText('body').insert(0, 'A');
+		await persister.syncNow();
+
+		client.errors.set('document_yjs_updates', {
+			message: 'network unavailable',
+			status: 503,
+		});
+		await persister.retryRejected();
+		row.getText('body').insert(1, 'B');
+		await persister.syncNow();
+		const retryingState = await CrdtLocalState.open(databaseName, 'user');
+		await expect(retryingState.getQuarantined()).resolves.toEqual([
+			expect.objectContaining({ state: 'retrying' }),
+		]);
+		await expect(retryingState.getOutbox()).resolves.toHaveLength(1);
+		retryingState.close();
+		expect(client.rows.get('document_yjs_updates')).toHaveLength(0);
+
+		client.errors.delete('document_yjs_updates');
+		await persister.syncNow();
+		expect(persister.getSyncStatus()).toMatchObject({ pendingCount: 0, rejectedCount: 0 });
+		expect(client.rows.get('document_yjs_updates')).toHaveLength(1);
+		const completedState = await CrdtLocalState.open(databaseName, 'user');
+		await expect(completedState.getQuarantined()).resolves.toEqual([]);
+		completedState.close();
+		await persister.destroy();
+	});
+
+	it('coalesces multiple pending envelopes for one document before upload', async () => {
+		const client = new MemorySupabase();
+		client.rows.set('documents', [{ id: 'doc-1', owner_id: 'user' }]);
+		const databaseName = `outbox-coalescing-${crypto.randomUUID()}`;
+		const store = createStore().setRow('documents', 'doc-1', { owner_id: 'user' });
+		const persister = await createSupabasePersister(store, configuration(client, databaseName));
+		const row = await persister.openRow('documents', 'doc-1');
+		client.errors.set('document_yjs_updates', {
+			message: 'network unavailable',
+			status: 503,
+		});
+		row.getText('body').insert(0, 'A');
+		await persister.syncNow();
+		row.getText('body').insert(1, 'B');
+		await persister.syncNow();
+
+		const pendingState = await CrdtLocalState.open(databaseName, 'user');
+		await expect(pendingState.getOutbox()).resolves.toHaveLength(1);
+		await expect(pendingState.getDocumentUpdates('documents\0doc-1')).resolves.toHaveLength(1);
+		pendingState.close();
+
+		client.errors.delete('document_yjs_updates');
+		await persister.syncNow();
+		const receiverStore = createStore().setRow('documents', 'doc-1', { owner_id: 'user' });
+		const receiver = await createSupabasePersister(
+			receiverStore,
+			configuration(client, `outbox-coalescing-receiver-${crypto.randomUUID()}`),
+		);
+		await receiver.openRow('documents', 'doc-1');
+		expect(receiverStore.getCell('documents', 'doc-1', 'body')).toBe('AB');
+		await receiver.destroy();
+		await persister.destroy();
+	});
+
+	it('discards the complete quarantined chain and invalidates its open handle', async () => {
+		const client = new MemorySupabase();
+		client.rows.set('documents', [{ id: 'doc-1', owner_id: 'user' }]);
+		const databaseName = `quarantine-discard-${crypto.randomUUID()}`;
+		const store = createStore().setRow('documents', 'doc-1', { owner_id: 'user' });
+		const persister = await createSupabasePersister(store, configuration(client, databaseName));
+		const row = await persister.openRow('documents', 'doc-1');
+		row.getText('body').insert(0, 'Accepted');
+		await persister.syncNow();
+
+		client.errors.set('document_yjs_updates', { message: 'forbidden', status: 403 });
+		row.getText('body').insert(8, ' rejected');
+		await persister.syncNow();
+		row.getText('body').insert(17, ' successor');
+		await persister.syncNow();
+		expect(store.getCell('documents', 'doc-1', 'body')).toBe('Accepted rejected successor');
+
+		await persister.discardRejected();
+		expect(persister.isRowOpen('documents', 'doc-1')).toBe(false);
+		expect(store.hasCell('documents', 'doc-1', 'body')).toBe(false);
+		expect(() => row.getText('body').insert(0, 'stale')).toThrow('is closed');
+		const state = await CrdtLocalState.open(databaseName, 'user');
+		await expect(state.getBuffered()).resolves.toHaveLength(0);
+		await expect(state.getOutbox()).resolves.toHaveLength(0);
+		await expect(state.getRejected()).resolves.toHaveLength(0);
+		await expect(state.getQuarantined()).resolves.toHaveLength(0);
+		await expect(state.getDocumentUpdates('documents\0doc-1')).resolves.toHaveLength(1);
+		state.close();
+
+		client.errors.delete('document_yjs_updates');
+		await persister.openRow('documents', 'doc-1');
+		expect(store.getCell('documents', 'doc-1', 'body')).toBe('Accepted');
+		await persister.destroy();
+	});
+
+	it('quarantines one document without blocking another document', async () => {
+		const client = new MemorySupabase();
+		client.rows.set('documents', [
+			{ id: 'blocked', owner_id: 'user' },
+			{ id: 'writable', owner_id: 'user' },
+		]);
+		const store = createStore()
+			.setRow('documents', 'blocked', { owner_id: 'user' })
+			.setRow('documents', 'writable', { owner_id: 'user' });
+		const persister = await createSupabasePersister(
+			store,
+			configuration(client, `quarantine-isolation-${crypto.randomUUID()}`),
+		);
+		const blocked = await persister.openRow('documents', 'blocked');
+		const writable = await persister.openRow('documents', 'writable');
+		client.errors.set('document_yjs_updates', { message: 'forbidden', status: 403 });
+		blocked.getText('body').insert(0, 'Blocked');
+		await persister.syncNow();
+
+		client.errors.delete('document_yjs_updates');
+		blocked.getText('body').insert(7, ' successor');
+		writable.getText('body').insert(0, 'Uploaded');
+		await persister.syncNow();
+		expect(client.rows.get('document_yjs_updates')).toEqual([
+			expect.objectContaining({ document_id: 'writable' }),
+		]);
+		await persister.destroy();
 	});
 });

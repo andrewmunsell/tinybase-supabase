@@ -35,4 +35,11 @@ Use `toRemote` and `fromRemote` when cell and column names differ or when the
 application needs a domain codec. The package automatically adds the configured
 primary key to every outgoing row.
 
-`read-only` mappings are pulled normally but never create an outbox operation.
+`read-only` mappings are pulled normally but never create or upload an ordinary
+or CRDT outbox operation. CRDT rows can still be opened to hydrate, follow, and
+project their remote content; local mutations through their Yjs handles throw.
+
+For mixed-access tables, keep the mapping read-write, expose editing controls
+for writable rows, and enforce row permissions with Supabase RLS. Permanent
+CRDT write failures are quarantined per row so dependent local updates cannot
+upload out of order.

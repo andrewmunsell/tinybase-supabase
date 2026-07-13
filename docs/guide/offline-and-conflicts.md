@@ -20,12 +20,21 @@ values, configure [collaborative CRDT cells](./collaborative-crdts).
 
 Validation and RLS failures become rejected operations. The optimistic TinyBase
 row remains visible so the application can explain the error and let the user
-repair it.
+repair it. CRDT failures additionally quarantine the affected document's
+outbound history; later local edits remain optimistic but are held behind the
+rejected update.
 
 ```ts
 const rejected = await persister.getRejectedOperations();
 
 await persister.retryRejected();
-// or stop retrying; this does not mutate the local optimistic row:
+// Or discard. Ordinary optimistic rows remain unchanged; affected CRDT rows
+// abandon all unaccepted updates, close, and must be opened again.
 await persister.discardRejected();
 ```
+
+For CRDT documents, retry merges the rejected update with every held successor
+before upload. The document stays quarantined through transient retry failures.
+Discard invalidates existing row handles as well as removing the unaccepted
+local history, so call `openRow()` again before editing or reading its live Yjs
+types.

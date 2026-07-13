@@ -74,6 +74,21 @@ const waitForCrdtConvergence = async (first: Page, second: Page, id: string): Pr
 	throw new Error(`Timed out waiting for CRDT document ${id} to converge`);
 };
 
+const waitForCrdtText = async (page: Page, id: string, text: string): Promise<void> => {
+	for (let attempt = 0; attempt < 50; attempt += 1) {
+		if (
+			(await page.evaluate(
+				(documentId) => window.tinybaseSupabaseTest.getCrdtText(documentId),
+				id,
+			)) === text
+		) {
+			return;
+		}
+		await new Promise((resolve) => setTimeout(resolve, 100));
+	}
+	throw new Error(`Timed out waiting for CRDT document ${id} to contain ${text}`);
+};
+
 e2eDescribe('browser end-to-end synchronization', () => {
 	jest.setTimeout(45_000);
 
@@ -281,5 +296,215 @@ e2eDescribe('browser end-to-end synchronization', () => {
 		await first.context.close();
 		await second.page.evaluate(() => window.tinybaseSupabaseTest.destroy());
 		await second.context.close();
+	});
+
+	it('hydrates and follows CRDT content without uploading from a read-only browser', async () => {
+		const ownerEmail = `browser-crdt-owner-${crypto.randomUUID()}@example.test`;
+		const readerEmail = `browser-crdt-reader-${crypto.randomUUID()}@example.test`;
+		const password = 'correct-horse-battery-staple';
+		for (const email of [ownerEmail, readerEmail]) {
+			const registration = await fetch(`${apiUrl}/auth/v1/signup`, {
+				body: JSON.stringify({ email, password }),
+				headers: { apikey: anonKey as string, 'content-type': 'application/json' },
+				method: 'POST',
+			});
+			expect(registration.ok).toBe(true);
+		}
+
+		const owner = await createPage();
+		const ownerId = await owner.page.evaluate(
+			({ email, nextPassword }) => window.tinybaseSupabaseTest.boot(email, nextPassword),
+			{ email: ownerEmail, nextPassword: password },
+		);
+		const documentId = `browser-read-only-${crypto.randomUUID()}`;
+		await owner.page.evaluate(
+			({ id, nextOwnerId }) =>
+				window.tinybaseSupabaseTest.createCrdtDocument(id, nextOwnerId),
+			{ id: documentId, nextOwnerId: ownerId },
+		);
+		await owner.page.evaluate(
+			(id) => window.tinybaseSupabaseTest.openCrdtDocument(id),
+			documentId,
+		);
+		await owner.page.evaluate(
+			(id) => window.tinybaseSupabaseTest.editCrdtText(id, 'Initial'),
+			documentId,
+		);
+		await owner.page.evaluate(() => window.tinybaseSupabaseTest.sync());
+
+		const reader = await createPage();
+		const readerId = await reader.page.evaluate(
+			({ email, nextPassword }) =>
+				window.tinybaseSupabaseTest.boot(email, nextPassword, true),
+			{ email: readerEmail, nextPassword: password },
+		);
+		await owner.page.evaluate(
+			({ id, nextReaderId }) => window.tinybaseSupabaseTest.addCrdtReader(id, nextReaderId),
+			{ id: documentId, nextReaderId: readerId },
+		);
+		await reader.page.evaluate(() => window.tinybaseSupabaseTest.sync());
+		await reader.page.evaluate(
+			(id) => window.tinybaseSupabaseTest.openCrdtDocument(id),
+			documentId,
+		);
+		expect(
+			await reader.page.evaluate(
+				(id) => window.tinybaseSupabaseTest.getCrdtText(id),
+				documentId,
+			),
+		).toBe('Initial');
+
+		await owner.page.evaluate(
+			(id) => window.tinybaseSupabaseTest.editCrdtText(id, ' remote'),
+			documentId,
+		);
+		await owner.page.evaluate(() => window.tinybaseSupabaseTest.sync());
+		await waitForCrdtText(reader.page, documentId, 'Initial remote');
+		const remoteUpdateCount = await reader.page.evaluate(
+			(id) => window.tinybaseSupabaseTest.getRemoteCrdtUpdateCount(id),
+			documentId,
+		);
+
+		await expect(
+			reader.page.evaluate(
+				(id) => window.tinybaseSupabaseTest.editCrdtText(id, ' local'),
+				documentId,
+			),
+		).rejects.toThrow('is read-only');
+		await reader.page.evaluate(() => window.tinybaseSupabaseTest.sync());
+		expect(
+			await reader.page.evaluate(() => window.tinybaseSupabaseTest.getCrdtSyncStatus()),
+		).toEqual({ pendingCount: 0, rejectedCount: 0 });
+		expect(
+			await reader.page.evaluate(
+				(id) => window.tinybaseSupabaseTest.getRemoteCrdtUpdateCount(id),
+				documentId,
+			),
+		).toBe(remoteUpdateCount);
+
+		await reader.page.evaluate(() => window.tinybaseSupabaseTest.restartPersister());
+		await reader.page.evaluate(
+			(id) => window.tinybaseSupabaseTest.openCrdtDocument(id),
+			documentId,
+		);
+		expect(
+			await reader.page.evaluate(
+				(id) => window.tinybaseSupabaseTest.getCrdtText(id),
+				documentId,
+			),
+		).toBe('Initial remote');
+
+		await owner.page.evaluate(() => window.tinybaseSupabaseTest.destroy());
+		await owner.context.close();
+		await reader.page.evaluate(() => window.tinybaseSupabaseTest.destroy());
+		await reader.context.close();
+	});
+
+	it('quarantines rejected CRDT history across restart and discards it authoritatively', async () => {
+		const ownerEmail = `browser-quarantine-owner-${crypto.randomUUID()}@example.test`;
+		const readerEmail = `browser-quarantine-reader-${crypto.randomUUID()}@example.test`;
+		const password = 'correct-horse-battery-staple';
+		for (const email of [ownerEmail, readerEmail]) {
+			const registration = await fetch(`${apiUrl}/auth/v1/signup`, {
+				body: JSON.stringify({ email, password }),
+				headers: { apikey: anonKey as string, 'content-type': 'application/json' },
+				method: 'POST',
+			});
+			expect(registration.ok).toBe(true);
+		}
+
+		const owner = await createPage();
+		const ownerId = await owner.page.evaluate(
+			({ email, nextPassword }) => window.tinybaseSupabaseTest.boot(email, nextPassword),
+			{ email: ownerEmail, nextPassword: password },
+		);
+		const documentId = `browser-quarantine-${crypto.randomUUID()}`;
+		await owner.page.evaluate(
+			({ id, nextOwnerId }) =>
+				window.tinybaseSupabaseTest.createCrdtDocument(id, nextOwnerId),
+			{ id: documentId, nextOwnerId: ownerId },
+		);
+		await owner.page.evaluate(
+			(id) => window.tinybaseSupabaseTest.openCrdtDocument(id),
+			documentId,
+		);
+		await owner.page.evaluate(
+			(id) => window.tinybaseSupabaseTest.editCrdtText(id, 'Authoritative'),
+			documentId,
+		);
+		await owner.page.evaluate(() => window.tinybaseSupabaseTest.sync());
+
+		const reader = await createPage();
+		const readerId = await reader.page.evaluate(
+			({ email, nextPassword }) => window.tinybaseSupabaseTest.boot(email, nextPassword),
+			{ email: readerEmail, nextPassword: password },
+		);
+		await owner.page.evaluate(
+			({ id, nextReaderId }) => window.tinybaseSupabaseTest.addCrdtReader(id, nextReaderId),
+			{ id: documentId, nextReaderId: readerId },
+		);
+		await reader.page.evaluate(() => window.tinybaseSupabaseTest.sync());
+		await reader.page.evaluate(
+			(id) => window.tinybaseSupabaseTest.openCrdtDocument(id),
+			documentId,
+		);
+		expect(
+			await reader.page.evaluate(
+				(id) => window.tinybaseSupabaseTest.getCrdtText(id),
+				documentId,
+			),
+		).toBe('Authoritative');
+
+		await reader.page.evaluate(
+			(id) => window.tinybaseSupabaseTest.editCrdtText(id, ' rejected'),
+			documentId,
+		);
+		await reader.page.evaluate(() => window.tinybaseSupabaseTest.sync());
+		expect(
+			await reader.page.evaluate(() => window.tinybaseSupabaseTest.getCrdtSyncStatus()),
+		).toEqual({ pendingCount: 0, rejectedCount: 1 });
+		await reader.page.evaluate(
+			(id) => window.tinybaseSupabaseTest.editCrdtText(id, ' successor'),
+			documentId,
+		);
+		await reader.page.evaluate(() => window.tinybaseSupabaseTest.sync());
+		expect(
+			await reader.page.evaluate(
+				(id) => window.tinybaseSupabaseTest.getRemoteCrdtUpdateCount(id),
+				documentId,
+			),
+		).toBe(1);
+
+		await reader.page.evaluate(() => window.tinybaseSupabaseTest.restartPersister());
+		await reader.page.evaluate(
+			(id) => window.tinybaseSupabaseTest.openCrdtDocument(id),
+			documentId,
+		);
+		expect(
+			await reader.page.evaluate(
+				(id) => window.tinybaseSupabaseTest.getCrdtText(id),
+				documentId,
+			),
+		).toBe('Authoritative rejected successor');
+
+		await reader.page.evaluate(() => window.tinybaseSupabaseTest.discardRejected());
+		await reader.page.evaluate(
+			(id) => window.tinybaseSupabaseTest.openCrdtDocument(id),
+			documentId,
+		);
+		expect(
+			await reader.page.evaluate(
+				(id) => window.tinybaseSupabaseTest.getCrdtText(id),
+				documentId,
+			),
+		).toBe('Authoritative');
+		expect(
+			await reader.page.evaluate(() => window.tinybaseSupabaseTest.getCrdtSyncStatus()),
+		).toEqual({ pendingCount: 0, rejectedCount: 0 });
+
+		await owner.page.evaluate(() => window.tinybaseSupabaseTest.destroy());
+		await owner.context.close();
+		await reader.page.evaluate(() => window.tinybaseSupabaseTest.destroy());
+		await reader.context.close();
 	});
 });
