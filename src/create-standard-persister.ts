@@ -145,7 +145,6 @@ export const createStandardPersister = async (
 				await state.removeOperation(operation.id);
 				continue;
 			}
-
 			try {
 				await transport.upsert(tableConfig, operation.payload);
 				await state.removeOperation(operation.id);

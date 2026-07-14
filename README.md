@@ -85,7 +85,7 @@ Each entry in `tables` supports these options:
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `table` | `string` | Required | Remote Supabase table name. The containing object key is the TinyBase table ID. |
-| `mode` | `'read-write' \| 'read-only'` | `'read-write'` | Read-only mappings pull remote rows but never enqueue local writes. |
+| `mode` | `'read-write' \| 'read-only'` | `'read-write'` | Read-only mappings pull remote rows but never enqueue or upload local ordinary or CRDT writes. |
 | `idColumn` | `string` | `'id'` | Existing remote primary-key column. IDs must be created by the application and are always added to outgoing rows. |
 | `deletedAtColumn` | `string` | `'deleted_at'` | Existing nullable timestamp column used for soft-delete tombstones. |
 | `dependsOn` | `readonly string[]` | `[]` | TinyBase table IDs that must be uploaded before this table. Tombstones are sent in the reverse dependency order. |
@@ -150,8 +150,11 @@ const persister = await createSupabasePersister(store, {
 });
 ```
 
-`crdtCells` cannot be combined with `mode: 'read-only'`. If any collaborative
-cells are configured, provide the update table and policies described in the
+`crdtCells` can be combined with `mode: 'read-only'`. The persister still
+hydrates, follows, and projects remote Yjs updates, but local mutations through
+the Yjs handles throw before changing the document and are never retained or
+uploaded. If any collaborative cells are configured, provide
+the update table and policies described in the
 [collaborative CRDT guide](docs/guide/collaborative-crdts.md).
 
 ## Database contract
@@ -166,16 +169,27 @@ for renamed columns or domain codecs. JSON values, arrays, nullable values,
 dates encoded as strings, and storage-path references are supported by normal
 Supabase column mappings.
 
-`mode: 'read-only'` pulls a table but never queues writes. This is suitable for
-public reference data and data available through read-only RLS policies.
+`mode: 'read-only'` pulls a table but never queues or uploads ordinary or CRDT
+writes. This is suitable for public reference data and data available through
+read-only RLS policies. For mixed-access tables, use read-write synchronization,
+control editing in the application, and enforce row permissions with Supabase
+RLS.
 
 ## Synchronization behavior
 
 Writes are locally durable once the IndexedDB transaction completes. While
 offline, edits remain optimistic in TinyBase and are queued. Permanent Supabase
 errors such as RLS rejection are retained as rejected operations; inspect them
-with `getRejectedOperations`, then retry or discard them. Discarding stops
-retries but deliberately does not alter the local optimistic row.
+with `getRejectedOperations`, then retry or discard them. Ordinary rejected
+operations retain their optimistic TinyBase row when discarded. A rejected
+CRDT update quarantines that document's outbound history: later local edits stay
+optimistic but cannot upload ahead of the rejected update. Retrying uploads the
+merged causal chain; discarding removes every unaccepted local CRDT update,
+closes the affected row, and requires `openRow` before further use.
+
+During a CRDT retry, the document remains quarantined until the complete merged
+chain is accepted. A transient retry failure leaves that chain pending for the
+normal backoff scheduler instead of allowing newer updates to bypass it.
 
 Transient failures retry with capped exponential backoff. Sync also runs on
 browser reconnect and when a hidden tab becomes visible, in addition to the
@@ -219,7 +233,8 @@ The local fixture covers private authenticated todo data, invalid RLS writes,
 anonymous public data with and without RLS, Realtime and non-Realtime tables,
 and Chromium browser scenarios for offline reload, reconnect, Realtime,
 two-client server-arrival conflict resolution, durable CRDT rehydration, and
-concurrent Y.Text convergence.
+concurrent Y.Text convergence. It also covers read-only CRDT hydration,
+Realtime following, blocked local uploads, and authoritative restart behavior.
 
 Formatting is enforced by Biome with four-width tabs, semicolons, single
 quotes, trailing commas, and no internal barrel files.

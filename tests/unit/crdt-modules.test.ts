@@ -13,16 +13,30 @@ import { createShadowStoreBridge } from '../../src/crdt/shadow-store.js';
 import { CrdtTransport } from '../../src/crdt/transport.js';
 
 describe('CRDT modules', () => {
-	it('upgrades existing CRDT IndexedDB state with a durable buffer store', async () => {
-		const databaseName = `buffer-upgrade-${crypto.randomUUID()}`;
-		const database = await openDB(`${databaseName}:user:yjs`, 1, {
+	it('upgrades existing CRDT IndexedDB state with document quarantine', async () => {
+		const databaseName = `quarantine-upgrade-${crypto.randomUUID()}`;
+		const database = await openDB(`${databaseName}:user:yjs`, 2, {
 			upgrade(upgradeDatabase) {
 				const updates = upgradeDatabase.createObjectStore('updates');
 				updates.createIndex('documentKey', 'documentKey');
 				upgradeDatabase.createObjectStore('outbox');
 				upgradeDatabase.createObjectStore('rejected');
+				const buffered = upgradeDatabase.createObjectStore('buffered');
+				buffered.createIndex('documentKey', 'documentKey');
 			},
 		});
+		await database.put(
+			'rejected',
+			{
+				documentKey: 'documents\0doc-1',
+				error: 'forbidden',
+				id: 'rejected-1',
+				rowId: 'doc-1',
+				tableId: 'documents',
+				update: Uint8Array.from([1, 2]),
+			},
+			'rejected-1',
+		);
 		database.close();
 
 		const state = await CrdtLocalState.open(databaseName, 'user');
@@ -35,6 +49,13 @@ describe('CRDT modules', () => {
 			update: Uint8Array.from([1, 2]),
 		});
 		await expect(state.getBuffered()).resolves.toHaveLength(1);
+		await expect(state.getQuarantined()).resolves.toEqual([
+			expect.objectContaining({
+				documentKey: 'documents\0doc-1',
+				failedUpdateId: 'rejected-1',
+				state: 'rejected',
+			}),
+		]);
 		state.close();
 	});
 
@@ -60,7 +81,7 @@ describe('CRDT modules', () => {
 				tables: { todos: { crdtCells: { body: { type: 'text' } }, table: 'todos' } },
 			}),
 		).toThrow('no crdtUpdatesTable');
-		expect(() =>
+		expect(
 			getConfiguredCrdtTables({
 				...ordinary,
 				tables: {
@@ -72,7 +93,12 @@ describe('CRDT modules', () => {
 					},
 				},
 			}),
-		).toThrow('cannot combine read-only mode with CRDT cells');
+		).toEqual({
+			todos: expect.objectContaining({
+				crdtUpdatesTable: 'todo_updates',
+				mode: 'read-only',
+			}),
+		});
 	});
 
 	it('projects each supported Yjs type and strips only configured cells from metadata', () => {

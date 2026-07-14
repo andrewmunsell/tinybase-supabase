@@ -15,6 +15,7 @@ interface OpenDocument {
 	readonly channel?: CrdtRealtimeChannel;
 	readonly document: Y.Doc;
 	readonly handle: CrdtRowHandle;
+	readonly lifecycle: { active: boolean };
 	readonly pendingWrites: Set<Promise<void>>;
 	readonly rowId: string;
 	readonly tableId: string;
@@ -69,12 +70,19 @@ export const createCrdtCoordinator = async (
 	let destroyed = false;
 	let started = false;
 	let syncGeneration = 0;
-	const [initialOutbox, initialBuffer] = await Promise.all([
+	const readOnlyTableIds = new Set(
+		Object.entries(tables)
+			.filter(([, table]) => table.mode === 'read-only')
+			.map(([tableId]) => tableId),
+	);
+	await state.discardTableLocalState(readOnlyTableIds);
+	const [initialOutbox, initialBuffer, initialRejected] = await Promise.all([
 		state.getOutbox(),
 		state.getBuffered(),
+		state.getRejected(),
 	]);
 	let pendingCount = initialOutbox.length + initialBuffer.length;
-	let rejectedCount = (await state.getRejected()).length;
+	let rejectedCount = initialRejected.length;
 	const reportError = (error: unknown): void =>
 		config.onError?.(error instanceof Error ? error : new Error(String(error)));
 	const waitForPendingWrites = async (): Promise<void> => {
@@ -109,7 +117,18 @@ export const createCrdtCoordinator = async (
 					first.bufferedAt - second.bufferedAt || first.id.localeCompare(second.id),
 			);
 			const first = updates[0];
-			if (!first || (!force && first.bufferedAt + updateBufferMs > now)) {
+			if (!first) {
+				continue;
+			}
+			const table = tables[first.tableId];
+			if (!table || table.mode === 'read-only') {
+				const discarded = await state.discardDocuments([first.documentKey]);
+				pendingCount -= discarded.pendingCount;
+				rejectedCount -= discarded.rejectedCount;
+				onStatusChange();
+				continue;
+			}
+			if (!force && first.bufferedAt + updateBufferMs > now) {
 				continue;
 			}
 			const merged: StoredCrdtUpdate = {
@@ -134,6 +153,41 @@ export const createCrdtCoordinator = async (
 		await scheduleBufferedUpdates();
 	};
 
+	const coalesceOutboxUpdates = async (): Promise<StoredCrdtUpdate[]> => {
+		const byDocument = new Map<string, StoredCrdtUpdate[]>();
+		for (const update of await state.getOutbox()) {
+			const updates = byDocument.get(update.documentKey) ?? [];
+			updates.push(update);
+			byDocument.set(update.documentKey, updates);
+		}
+		const coalesced: StoredCrdtUpdate[] = [];
+		for (const updates of byDocument.values()) {
+			const first = updates[0];
+			if (!first) {
+				continue;
+			}
+			if (updates.length === 1) {
+				coalesced.push(first);
+				continue;
+			}
+			const merged: StoredCrdtUpdate = {
+				documentKey: first.documentKey,
+				id: crypto.randomUUID(),
+				rowId: first.rowId,
+				tableId: first.tableId,
+				update: Y.mergeUpdates(updates.map(({ update }) => update)),
+			};
+			await state.replaceOutboxUpdates(
+				updates.map(({ id }) => id),
+				merged,
+			);
+			pendingCount -= updates.length - 1;
+			onStatusChange();
+			coalesced.push(merged);
+		}
+		return coalesced;
+	};
+
 	const getOpenProjection = (open: OpenDocument): Row =>
 		Object.fromEntries(
 			Object.entries(tables[open.tableId]?.crdtCells ?? {}).map(([cellId, cellConfig]) => [
@@ -144,6 +198,7 @@ export const createCrdtCoordinator = async (
 
 	const project = (open: OpenDocument): void => {
 		if (
+			open.lifecycle.active &&
 			documents.get(getDocumentKey(open.tableId, open.rowId))?.document === open.document &&
 			store.hasRow(open.tableId, open.rowId)
 		) {
@@ -243,6 +298,7 @@ export const createCrdtCoordinator = async (
 		await openingDocuments.get(key)?.catch(() => undefined);
 		const open = documents.get(key);
 		if (open) {
+			open.lifecycle.active = false;
 			await Promise.all(open.pendingWrites);
 			if (open.channel) {
 				await transport.unsubscribe(open.channel);
@@ -275,7 +331,6 @@ export const createCrdtCoordinator = async (
 		if (!store.hasRow(tableId, rowId)) {
 			throw new Error(`Cannot open missing CRDT row: ${tableId}.${rowId}`);
 		}
-
 		const document = new Y.Doc();
 		for (const [cellId, cellConfig] of Object.entries(table.crdtCells)) {
 			getProjection(document, cellId, cellConfig);
@@ -288,6 +343,53 @@ export const createCrdtCoordinator = async (
 			throw new Error(`CRDT row was closed while opening: ${tableId}.${rowId}`);
 		}
 		const pendingWrites = new Set<Promise<void>>();
+		const lifecycle = { active: true };
+		const assertWritable = (): void => {
+			if (!lifecycle.active) {
+				throw new Error(`CRDT row ${tableId}.${rowId} is closed`);
+			}
+			if (table.mode === 'read-only') {
+				throw new Error(`CRDT row ${tableId}.${rowId} is read-only`);
+			}
+		};
+		const mutatingMethods = new Set<PropertyKey>([
+			'applyDelta',
+			'clear',
+			'delete',
+			'format',
+			'insert',
+			'insertAfter',
+			'insertEmbed',
+			'push',
+			'removeAttribute',
+			'set',
+			'setAttribute',
+			'unshift',
+		]);
+		const guardedTypes = new WeakMap<object, object>();
+		const guardMutations = <SharedType extends object>(sharedType: SharedType): SharedType => {
+			const existing = guardedTypes.get(sharedType);
+			if (existing) {
+				return existing as SharedType;
+			}
+			const guarded = new Proxy(sharedType, {
+				get(target, property) {
+					const value: unknown = Reflect.get(target, property, target);
+					if (typeof value !== 'function' || property === 'constructor') {
+						return value;
+					}
+					if (mutatingMethods.has(property)) {
+						return (...args: unknown[]) => {
+							assertWritable();
+							return Reflect.apply(value, target, args);
+						};
+					}
+					return value.bind(target);
+				},
+			});
+			guardedTypes.set(sharedType, guarded);
+			return guarded;
+		};
 		const assertType = (cellId: string, expected: CrdtCellConfig['type']): void => {
 			const actual = table.crdtCells[cellId]?.type;
 			if (actual !== expected) {
@@ -303,25 +405,33 @@ export const createCrdtCoordinator = async (
 			},
 			getArray<T = unknown>(cellId: string): Y.Array<T> {
 				assertType(cellId, 'array');
-				return document.getArray<T>(cellId);
+				return guardMutations(document.getArray<T>(cellId));
 			},
 			getMap<T = unknown>(cellId: string): Y.Map<T> {
 				assertType(cellId, 'map');
-				return document.getMap<T>(cellId);
+				return guardMutations(document.getMap<T>(cellId));
 			},
 			getText(cellId: string): Y.Text {
 				assertType(cellId, 'text');
-				return document.getText(cellId);
+				return guardMutations(document.getText(cellId));
 			},
 			getXmlFragment(cellId: string): Y.XmlFragment {
 				assertType(cellId, 'xml-fragment');
-				return document.getXmlFragment(cellId);
+				return guardMutations(document.getXmlFragment(cellId));
 			},
 		};
-		open = { document, handle, pendingWrites, rowId, tableId };
+		open = { document, handle, lifecycle, pendingWrites, rowId, tableId };
 		documents.set(key, open);
 		document.on('update', (bytes: Uint8Array, origin: unknown) => {
 			if (origin === remoteOrigin) {
+				return;
+			}
+			if (!lifecycle.active || table.mode === 'read-only') {
+				reportError(
+					new Error(
+						`Ignored a local update for ${tableId}.${rowId} because the CRDT row is ${lifecycle.active ? 'read-only' : 'closed'}`,
+					),
+				);
 				return;
 			}
 			const update: BufferedCrdtUpdate = {
@@ -382,6 +492,7 @@ export const createCrdtCoordinator = async (
 			}
 			return handle;
 		} catch (error) {
+			lifecycle.active = false;
 			if (documents.get(key)?.document === document) {
 				documents.delete(key);
 			}
@@ -432,18 +543,38 @@ export const createCrdtCoordinator = async (
 			state.close();
 		},
 		async discardRejected() {
-			await state.discardRejected();
-			rejectedCount = 0;
+			const quarantined = await state.getQuarantined();
+			for (const { documentKey } of quarantined) {
+				const open = documents.get(documentKey);
+				if (open) {
+					open.lifecycle.active = false;
+				}
+			}
+			for (const { rowId, tableId } of quarantined) {
+				await closeRow(tableId, rowId);
+			}
+			const discarded = await state.discardDocuments(
+				quarantined.map(({ documentKey }) => documentKey),
+			);
+			pendingCount -= discarded.pendingCount;
+			rejectedCount -= discarded.rejectedCount;
 			onStatusChange();
 		},
 		async flushOutbox(isRowBlocked) {
 			await compactBufferedUpdates(false);
-			for (const update of await state.getOutbox()) {
+			const quarantined = new Map(
+				(await state.getQuarantined()).map((document) => [document.documentKey, document]),
+			);
+			for (const update of await coalesceOutboxUpdates()) {
 				const table = tables[update.tableId];
-				if (!table) {
-					await state.removeOutbox(update.id);
-					pendingCount -= 1;
+				if (!table || table.mode === 'read-only') {
+					const discarded = await state.discardDocuments([update.documentKey]);
+					pendingCount -= discarded.pendingCount;
+					rejectedCount -= discarded.rejectedCount;
 					onStatusChange();
+					continue;
+				}
+				if (quarantined.get(update.documentKey)?.state === 'rejected') {
 					continue;
 				}
 				if (await isRowBlocked(update.tableId, update.rowId)) {
@@ -451,12 +582,20 @@ export const createCrdtCoordinator = async (
 				}
 				try {
 					await transport.insertUpdate(update, table);
-					await state.removeOutbox(update.id);
+					await state.completeOutbox(update.id, update.documentKey);
 					pendingCount -= 1;
 					onStatusChange();
 				} catch (error) {
 					if (isPermanentError(error as SupabaseError)) {
 						await state.reject(update, (error as SupabaseError).message);
+						quarantined.set(update.documentKey, {
+							documentKey: update.documentKey,
+							error: (error as SupabaseError).message,
+							failedUpdateId: update.id,
+							rowId: update.rowId,
+							state: 'rejected',
+							tableId: update.tableId,
+						});
 						pendingCount -= 1;
 						rejectedCount += 1;
 						onStatusChange();
@@ -491,9 +630,9 @@ export const createCrdtCoordinator = async (
 			}
 		},
 		async retryRejected() {
-			await state.retryRejected();
-			pendingCount += rejectedCount;
-			rejectedCount = 0;
+			const retriedCount = await state.retryRejected();
+			pendingCount += retriedCount;
+			rejectedCount -= retriedCount;
 			onStatusChange();
 		},
 		async startSyncing() {

@@ -11,10 +11,16 @@ open CRDT IndexedDB state, subscribe to an updates table, or require any CRDT
 schema. A single configuration can contain ordinary tables, CRDT-enabled
 tables, and mixed rows with both ordinary and collaborative cells.
 
-CRDT-enabled tables cannot use `mode: 'read-only'`, because Yjs shared types are
-mutable handles. Enforce viewer/editor distinctions with updates-table RLS;
-unauthorized local edits remain durable rejected operations that can be retried
-or discarded explicitly.
+CRDT-enabled tables may use `mode: 'read-only'`. Their rows still fetch existing
+updates, subscribe to new updates, and project Yjs values into TinyBase, while
+local mutation attempts through the Yjs handles throw before changing the
+document. No local Yjs update is queued, persisted, or uploaded.
+
+For mixed-access tables, keep the mapping read-write, control editing in the
+application, and enforce viewer/editor distinctions with parent- and
+updates-table RLS. If RLS rejects a CRDT update, the document's outbound history
+is quarantined so dependent updates remain local until the rejection is retried
+or discarded.
 
 Keep IDs, owners, tenant IDs, foreign keys, and roles out of Yjs. Those fields
 belong on the parent row so Postgres can enforce relational integrity and RLS.
@@ -213,11 +219,11 @@ accept an arbitrary user ID from the caller.
 - Call `row.destroy()` or `persister.closeRow(tableId, rowId)` when a document is
   unmounted or deleted. `persister.destroy()` closes every remaining row.
   Closing releases the Y.Doc and its row-filtered Realtime channel.
-- Prefer `retryRejected()` for rejected CRDT updates. Later Yjs updates can
-  causally depend on an earlier rejected update; discarding that predecessor can
-  leave later server updates permanently pending and diverged from the optimistic
-  local document. Use `discardRejected()` only when the application will also
-  abandon or reset the affected local CRDT state.
+- A rejected CRDT update quarantines the complete document while continuing to
+  capture optimistic local edits. `retryRejected()` merges and uploads the
+  rejected update with every held successor. `discardRejected()` abandons all
+  unaccepted local updates, closes each affected CRDT row, and removes its
+  projection; call `openRow()` again to restore accepted cached and remote state.
 - Grant updates-table `insert` only to users trusted to submit valid Yjs binary
   updates. An authorized client can bypass this package and insert malformed or
   excessively large `bytea`, causing hydration failures or resource exhaustion.
@@ -228,10 +234,10 @@ accept an arbitrary user ID from the caller.
   and a cached row may remain locally readable. Revocation prevents future
   authoritative reads and inserts; rejected local writes remain visible through
   `getRejectedOperations()`.
-- The 500 ms buffer reduces new rows but is not historical compaction. Already
-  promoted or uploaded envelopes retain stable IDs for retry safety and are not
-  merged again. Long-running deployments still need a separate future retention
-  or snapshot strategy if full-history replay becomes too large.
+- The 500 ms buffer and per-document outbox coalescing reduce new rows but are
+  not historical compaction. Uploaded envelopes remain append-only. Long-running
+  deployments still need a separate future retention or snapshot strategy if
+  full-history replay becomes too large.
 
 RLS is enforced on authoritative pulls and writes; Realtime is only a wake-up
 signal.

@@ -12,11 +12,15 @@ interface BrowserEnvironment {
 }
 
 interface BrowserHarness {
-	boot(email: string, password: string): Promise<string>;
+	addCrdtReader(id: string, userId: string): Promise<void>;
+	boot(email: string, password: string, readOnlyCrdt?: boolean): Promise<string>;
 	createCrdtDocument(id: string, ownerId: string): Promise<void>;
+	discardRejected(): Promise<void>;
 	destroy(): Promise<void>;
 	editCrdtText(id: string, text: string): Promise<void>;
 	getCrdtText(id: string): string;
+	getCrdtSyncStatus(): { pendingCount: number; rejectedCount: number };
+	getRemoteCrdtUpdateCount(id: string): Promise<number>;
 	getTodo(id: string): Record<string, unknown>;
 	getRemoteTodo(id: string): Promise<Record<string, unknown> | null>;
 	openCrdtDocument(id: string): Promise<void>;
@@ -35,6 +39,7 @@ declare global {
 
 let client: SupabaseClient;
 const crdtRows = new Map<string, CrdtRowHandle>();
+let crdtReadOnly = false;
 let persister: SupabasePersister | undefined;
 let store: Store | undefined;
 
@@ -61,6 +66,7 @@ const startPersister = async (userId: string): Promise<void> => {
 				},
 				crdtRowIdColumn: 'document_id',
 				crdtUpdatesTable: 'crdt_document_updates',
+				mode: crdtReadOnly ? 'read-only' : 'read-write',
 				realtime: { debounceMs: 50 },
 				table: 'crdt_documents',
 			},
@@ -72,7 +78,17 @@ const startPersister = async (userId: string): Promise<void> => {
 };
 
 window.tinybaseSupabaseTest = {
-	async boot(email, password) {
+	async addCrdtReader(id, userId) {
+		const response = await client.from('crdt_document_collaborators').insert({
+			can_write: false,
+			document_id: id,
+			user_id: userId,
+		});
+		if (response.error) {
+			throw response.error;
+		}
+	},
+	async boot(email, password, readOnlyCrdt = false) {
 		const environment = getEnvironment();
 		client = createClient(environment.apiUrl, environment.anonKey, {
 			auth: { autoRefreshToken: false, persistSession: true },
@@ -87,6 +103,7 @@ window.tinybaseSupabaseTest = {
 			user = signedIn.data.user;
 		}
 
+		crdtReadOnly = readOnlyCrdt;
 		await startPersister(user.id);
 		return user.id;
 	},
@@ -97,6 +114,10 @@ window.tinybaseSupabaseTest = {
 		store.setRow('crdt_documents', id, { owner_id: ownerId, status: 'draft' });
 		await persister.save();
 		await persister.syncNow();
+	},
+	async discardRejected() {
+		await persister?.discardRejected();
+		crdtRows.clear();
 	},
 	async destroy() {
 		await persister?.destroy();
@@ -114,6 +135,23 @@ window.tinybaseSupabaseTest = {
 	},
 	getCrdtText(id) {
 		return String(store?.getCell('crdt_documents', id, 'body') ?? '');
+	},
+	getCrdtSyncStatus() {
+		const status = persister?.getSyncStatus();
+		return {
+			pendingCount: status?.pendingCount ?? 0,
+			rejectedCount: status?.rejectedCount ?? 0,
+		};
+	},
+	async getRemoteCrdtUpdateCount(id) {
+		const response = await client
+			.from('crdt_document_updates')
+			.select('id')
+			.eq('document_id', id);
+		if (response.error) {
+			throw response.error;
+		}
+		return response.data.length;
 	},
 	getTodo(id) {
 		return store?.getRow('todos', id) ?? {};

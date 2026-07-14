@@ -15,7 +15,7 @@ export interface SyncStatus {
 }
 
 export interface SupabaseTableConfig {
-	/** Read-only tables are pulled but never enqueue local write operations. */
+	/** Read-only tables are pulled but never enqueue ordinary or CRDT writes. */
 	readonly mode?: 'read-only' | 'read-write';
 	/** The TinyBase table Id. It is the key of `tables` in the main config. */
 	readonly table: string;
@@ -78,7 +78,9 @@ export interface SupabasePersister extends Persister {
 	getSyncStatus(): SyncStatus;
 	addSyncStatusListener(listener: (status: SyncStatus) => void): () => void;
 	getRejectedOperations(): Promise<readonly RejectedOperation[]>;
+	/** Requeues rejected writes. CRDT retries include their held causal successors. */
 	retryRejected(): Promise<void>;
+	/** Discards rejected writes. Affected CRDT rows are closed and must be reopened. */
 	discardRejected(): Promise<void>;
 	syncNow(): Promise<void>;
 	startSyncing(): Promise<void>;

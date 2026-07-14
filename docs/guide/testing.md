@@ -18,3 +18,9 @@ pnpm test:e2e
 The interactive example uses the same fixture at `http://127.0.0.1:55421`.
 Create a disposable local account in Supabase Studio or with the Auth API before
 signing in.
+
+The browser suite includes a read-only CRDT reader that hydrates existing
+content, follows a writer over Realtime, attempts a local edit, verifies that no
+update is uploaded, and restarts from authoritative remote content. It also
+covers RLS rejection, durable document quarantine across restart, and discard
+back to authoritative CRDT content.
