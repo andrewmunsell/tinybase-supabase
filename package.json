@@ -1,6 +1,6 @@
 {
 	"name": "tinybase-supabase",
-	"version": "0.2.1",
+	"version": "0.2.2",
 	"description": "Browser-only offline-first TinyBase persistence and Supabase synchronization.",
 	"license": "MIT",
 	"type": "module",
