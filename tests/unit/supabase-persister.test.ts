@@ -168,6 +168,18 @@ const configuration = (client: MemorySupabase, databaseName: string) => ({
 			deletedAtColumn: 'deleted_at',
 			realtime: true,
 			table: 'todos',
+			updatedAtColumn: 'updated_at',
+		},
+	},
+});
+
+const fullPullConfiguration = (client: MemorySupabase, databaseName: string) => ({
+	...configuration(client, databaseName),
+	tables: {
+		todos: {
+			deletedAtColumn: 'deleted_at',
+			realtime: true,
+			table: 'todos',
 		},
 	},
 });
@@ -221,12 +233,13 @@ describe('createSupabasePersister', () => {
 		await persister.destroy();
 	});
 
-	it('keeps permanent failures for explicit retry or discard', async () => {
+	it('keeps discarded optimistic rows across authoritative pulls and restarts', async () => {
 		const client = new MemorySupabase();
+		const databaseName = crypto.randomUUID();
 		const store = createStore();
 		const persister = await createSupabasePersister(
 			store,
-			configuration(client, crypto.randomUUID()),
+			fullPullConfiguration(client, databaseName),
 		);
 		await persister.startAutoPersisting();
 		client.permanentError = {
@@ -243,8 +256,34 @@ describe('createSupabasePersister', () => {
 		]);
 		await persister.discardRejected();
 		await expect(persister.getRejectedOperations()).resolves.toEqual([]);
+		expect(persister.getSyncStatus().rejectedCount).toBe(0);
+		await persister.retryRejected();
+		expect(persister.getSyncStatus()).toMatchObject({ pendingCount: 0, rejectedCount: 0 });
+		expect(store.getRow('todos', 'forbidden')).toEqual({ title: 'Denied' });
 
 		await persister.destroy();
+
+		const restartedStore = createStore();
+		const restarted = await createSupabasePersister(
+			restartedStore,
+			fullPullConfiguration(client, databaseName),
+		);
+		await restarted.startAutoPersisting();
+		expect(restartedStore.getRow('todos', 'forbidden')).toEqual({ title: 'Denied' });
+		client.permanentError = undefined;
+		restartedStore.setCell('todos', 'forbidden', 'title', 'Accepted');
+		await restarted.save();
+		await restarted.syncNow();
+		expect(client.rows.get('todos')?.get('forbidden')?.title).toBe('Accepted');
+		client.rows.get('todos')?.set('forbidden', {
+			deleted_at: null,
+			id: 'forbidden',
+			title: 'Remote authoritative',
+		});
+		await restarted.syncNow();
+		expect(restartedStore.getCell('todos', 'forbidden', 'title')).toBe('Remote authoritative');
+
+		await restarted.destroy();
 	});
 
 	it('uses realtime events as a debounced reconciliation wake-up', async () => {
@@ -266,6 +305,44 @@ describe('createSupabasePersister', () => {
 		await new Promise((resolve) => setTimeout(resolve, 250));
 
 		expect(store.getRow('todos', 'remote-1')).toEqual({ completed: true, title: 'Remote' });
+		await persister.destroy();
+	});
+
+	it('uses authoritative full pulls when updatedAtColumn is omitted', async () => {
+		const client = new MemorySupabase();
+		client.rows.set(
+			'todos',
+			new Map([
+				[
+					'legacy',
+					{
+						id: 'legacy',
+						title: 'Legacy',
+						updated_at: 'existing application value',
+					},
+				],
+				['without-timestamp', { id: 'without-timestamp', title: 'No timestamp' }],
+			]),
+		);
+		const store = createStore();
+		const persister = await createSupabasePersister(
+			store,
+			fullPullConfiguration(client, crypto.randomUUID()),
+		);
+		await persister.startAutoPersisting();
+
+		expect(store.getRow('todos', 'legacy')).toEqual({
+			title: 'Legacy',
+			updated_at: 'existing application value',
+		});
+		expect(store.getCell('todos', 'without-timestamp', 'title')).toBe('No timestamp');
+		client.rows.get('todos')?.delete('legacy');
+		await persister.syncNow();
+
+		expect(store.hasRow('todos', 'legacy')).toBe(false);
+		expect(client.cursorQueries).not.toContainEqual(
+			expect.objectContaining({ column: 'updated_at', table: 'todos' }),
+		);
 		await persister.destroy();
 	});
 
@@ -399,7 +476,7 @@ describe('createSupabasePersister', () => {
 		await persister.destroy();
 	});
 
-	it('continues pagination when Supabase caps pages below pageSize', async () => {
+	it('continues full-pull pagination when Supabase caps pages below pageSize', async () => {
 		const client = new MemorySupabase();
 		client.serverRowLimit = 2;
 		client.rows.set(
@@ -410,14 +487,13 @@ describe('createSupabasePersister', () => {
 					{
 						id: `row-${index}`,
 						title: `Row ${index}`,
-						updated_at: client.nextUpdatedAt(),
 					},
 				]),
 			),
 		);
 		const store = createStore();
 		const persister = await createSupabasePersister(store, {
-			...configuration(client, crypto.randomUUID()),
+			...fullPullConfiguration(client, crypto.randomUUID()),
 			pageSize: 10,
 		});
 		await persister.startAutoPersisting();
@@ -491,7 +567,9 @@ describe('createSupabasePersister', () => {
 		const store = createStore();
 		const second = await createSupabasePersister(store, {
 			...configuration(client, databaseName),
-			tables: { todos: { table: 'archived_todos' } },
+			tables: {
+				todos: { table: 'archived_todos', updatedAtColumn: 'updated_at' },
+			},
 		});
 		await second.startAutoPersisting();
 

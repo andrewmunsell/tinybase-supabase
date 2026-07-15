@@ -10,6 +10,7 @@ export interface PendingOperation {
 }
 
 export interface RejectedRecord extends PendingOperation {
+	readonly discarded?: true;
 	readonly error: string;
 }
 
@@ -94,6 +95,10 @@ export class LocalState {
 	}
 
 	async getRejected(): Promise<RejectedRecord[]> {
+		return (await this.#database.getAll('rejected')).filter(({ discarded }) => !discarded);
+	}
+
+	async getBlockedOperations(): Promise<RejectedRecord[]> {
 		return this.#database.getAll('rejected');
 	}
 
@@ -102,11 +107,15 @@ export class LocalState {
 	}
 
 	async persist(content: Content, operations: readonly PendingOperation[]): Promise<void> {
-		const transaction = this.#database.transaction(['content', 'outbox'], 'readwrite');
+		const transaction = this.#database.transaction(
+			['content', 'outbox', 'rejected'],
+			'readwrite',
+		);
 		await transaction.objectStore('content').put(content, 'store');
 
 		for (const operation of operations) {
 			await transaction.objectStore('outbox').put(operation, operation.id);
+			await transaction.objectStore('rejected').delete(operation.id);
 		}
 
 		await transaction.done;
@@ -130,10 +139,12 @@ export class LocalState {
 
 	async retryRejected(): Promise<void> {
 		const transaction = this.#database.transaction(['outbox', 'rejected'], 'readwrite');
-		const rejected = await transaction.objectStore('rejected').getAll();
+		const rejected = (await transaction.objectStore('rejected').getAll()).filter(
+			({ discarded }) => !discarded,
+		);
 
 		for (const operation of rejected) {
-			const { error: _error, ...pending } = operation;
+			const { discarded: _discarded, error: _error, ...pending } = operation;
 			await transaction.objectStore('outbox').put(pending, pending.id);
 			await transaction.objectStore('rejected').delete(operation.id);
 		}
@@ -142,6 +153,13 @@ export class LocalState {
 	}
 
 	async discardRejected(): Promise<void> {
-		await this.#database.clear('rejected');
+		const transaction = this.#database.transaction('rejected', 'readwrite');
+		const store = transaction.objectStore('rejected');
+		for (const operation of await store.getAll()) {
+			if (!operation.discarded) {
+				await store.put({ ...operation, discarded: true }, operation.id);
+			}
+		}
+		await transaction.done;
 	}
 }

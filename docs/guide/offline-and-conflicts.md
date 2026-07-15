@@ -16,12 +16,13 @@ This ordinary mode does not provide exactly-once delivery or cross-table
 transactions. For concurrent changes within selected text, map, or array
 values, configure [collaborative CRDT cells](./collaborative-crdts).
 
-Incremental pulls use server-managed update timestamps as pragmatic polling
-cursors, not as a commit-ordered change-data-capture log. The default
-five-minute lookback recovers ordinary short transactions that commit out of
-timestamp order. Applications with longer transactions, strict commit
-ordering, or dynamic per-row access changes should provide a durable
-application-specific change feed and version the affected `scopeKey`.
+When `updatedAtColumn` is configured, incremental pulls use server-managed
+timestamps as pragmatic polling cursors, not as a commit-ordered
+change-data-capture log. The default five-minute lookback recovers ordinary
+short transactions that commit out of timestamp order. Applications with
+longer transactions, strict commit ordering, or dynamic per-row access changes
+should provide a durable application-specific change feed and version the
+affected `scopeKey`. Omitting `updatedAtColumn` retains paginated full pulls.
 
 ## Rejected writes
 

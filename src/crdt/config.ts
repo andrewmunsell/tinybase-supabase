@@ -64,7 +64,7 @@ export const getStandardConfig = (config: SupabasePersisterConfig): SupabasePers
 										([column]) =>
 											column !== (table.idColumn ?? 'id') &&
 											column !== (table.deletedAtColumn ?? 'deleted_at') &&
-											column !== (table.updatedAtColumn ?? 'updated_at'),
+											column !== table.updatedAtColumn,
 									),
 								) as Row,
 							] as const);

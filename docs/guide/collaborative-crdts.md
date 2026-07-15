@@ -44,6 +44,7 @@ const persister = await createSupabasePersister(store, {
 			crdtRowIdColumn: 'document_id',
 			crdtUpdatesTable: 'document_yjs_updates',
 			table: 'documents',
+			updatedAtColumn: 'updated_at',
 		},
 	},
 });
@@ -81,7 +82,8 @@ path.
 With `realtime` enabled, both parent-row and updates-table notifications feed a
 single debounced reconciliation scheduler. Polling, reconnect, tab visibility,
 and `syncNow()` use that same path, so a missed notification can be recovered by
-a later cursor pull.
+a later cursor pull. If `updatedAtColumn` is omitted, parent-row reconciliation
+uses full pulls instead.
 
 Locally cached Yjs updates can be opened and edited when an authoritative pull
 fails transiently; the shared scheduler reports the offline state and retries.

@@ -2,7 +2,9 @@
 
 Each `tables` key is a TinyBase table Id. Its `table` value is the remote
 Supabase table. The default primary key is `id`, the default tombstone column is
-`deleted_at`, and the default incremental cursor column is `updated_at`.
+`deleted_at`, and incremental pulls are opt-in with `updatedAtColumn`. We
+strongly recommend a server-managed `updated_at` column; when the option is
+omitted, every reconciliation performs a paginated full authoritative pull.
 
 Collaborative cells are configured on the same table mapping with `crdtCells`,
 `crdtUpdatesTable`, and optionally `crdtRowIdColumn`. Omit `crdtCells` for the
@@ -13,15 +15,17 @@ for the complete update-table and RLS contract.
 merged per row before upload. It defaults to `500`; set it to `0` for immediate
 upload. Local durability is not delayed.
 
-Parent-row cursors overlap by `cursorLookbackMs` (five minutes by default) to
-recover short transactions that commit out of timestamp order. Set a table's
-`cursorVersion` to a new stable value after changing its remote projection or
-codec so the next synchronization performs a full pull for that mapping.
+Configured parent-row cursors overlap by `cursorLookbackMs` (five minutes by
+default) to recover short transactions that commit out of timestamp order. Set
+a table's `cursorVersion` to a new stable value after changing its remote
+projection or codec so the next synchronization performs a full pull for that
+mapping.
 
 ```ts
 tables: {
 	projects: {
 		table: 'projects',
+		updatedAtColumn: 'updated_at',
 	},
 	todos: {
 		dependsOn: ['projects'],
@@ -34,6 +38,7 @@ tables: {
 	publicTemplates: {
 		mode: 'read-only',
 		table: 'public_templates',
+		updatedAtColumn: 'updated_at',
 	},
 }
 ```

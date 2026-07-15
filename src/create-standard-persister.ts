@@ -111,29 +111,33 @@ export const createStandardPersister = async (
 			return;
 		}
 
+		const updatedAtColumn = tableConfig.updatedAtColumn;
 		const cursorKey = JSON.stringify([
 			tableId,
 			tableConfig.table,
 			tableConfig.idColumn ?? 'id',
 			tableConfig.deletedAtColumn ?? 'deleted_at',
-			tableConfig.updatedAtColumn ?? 'updated_at',
+			updatedAtColumn ?? null,
 			tableConfig.select ?? '*',
 			tableConfig.cursorVersion ?? '',
 		]);
-		const cursor = await state.getCursor(cursorKey);
+		const cursor = updatedAtColumn ? await state.getCursor(cursorKey) : undefined;
 		const cursorTime = cursor ? Date.parse(cursor.updatedAt) : Number.NaN;
 		const pullCursor =
 			cursor && cursorLookbackMs > 0 && Number.isFinite(cursorTime)
 				? { updatedAt: new Date(cursorTime - cursorLookbackMs).toISOString() }
 				: cursor;
 		const { cursor: pulledCursor, rows } = await transport.fetchRows(tableConfig, pullCursor);
-		const pulledCursorTime = Date.parse(pulledCursor.updatedAt);
+		const pulledCursorTime = pulledCursor ? Date.parse(pulledCursor.updatedAt) : Number.NaN;
 		const nextCursor = cursor && pulledCursorTime <= cursorTime ? cursor : pulledCursor;
 
 		const content = cloneContent((await state.getContent()) ?? lastContent);
 		const table: Table = { ...getRows(content, tableId) };
-		const [pending, rejected] = await Promise.all([state.getOperations(), state.getRejected()]);
-		const blockedIds = new Set([...pending, ...rejected].map((operation) => operation.id));
+		const [pending, blocked] = await Promise.all([
+			state.getOperations(),
+			state.getBlockedOperations(),
+		]);
+		const blockedIds = new Set([...pending, ...blocked].map((operation) => operation.id));
 		const seen = new Set<string>();
 		const deletedAtColumn = tableConfig.deletedAtColumn ?? 'deleted_at';
 

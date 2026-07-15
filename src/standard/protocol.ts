@@ -21,7 +21,7 @@ interface SelectQuery extends PromiseLike<SupabaseResponse> {
 }
 
 export interface FetchRowsResult {
-	readonly cursor: SyncCursor;
+	readonly cursor?: SyncCursor;
 	readonly rows: SupabaseRow[];
 }
 
@@ -64,7 +64,33 @@ export class StandardTransport {
 		const rows: SupabaseRow[] = [];
 		const deletedAtColumn = config.deletedAtColumn ?? 'deleted_at';
 		const idColumn = config.idColumn ?? 'id';
-		const updatedAtColumn = config.updatedAtColumn ?? 'updated_at';
+		const updatedAtColumn = config.updatedAtColumn;
+		if (!updatedAtColumn) {
+			let afterId: string | undefined;
+			while (true) {
+				let query = this.#client.from(config.table).select(config.select ?? '*');
+				if (afterId) {
+					query = query.gt(idColumn, afterId);
+				}
+				const response = await query.order(idColumn).limit(this.#pageSize);
+				if (response.error) {
+					throw response.error;
+				}
+				const page = Array.isArray(response.data) ? (response.data as SupabaseRow[]) : [];
+				for (const row of page) {
+					if (typeof row[idColumn] !== 'string' || !(deletedAtColumn in row)) {
+						throw new Error(
+							`Table ${config.table} must select ${idColumn} and ${deletedAtColumn}`,
+						);
+					}
+				}
+				rows.push(...page);
+				if (page.length === 0) {
+					return { rows };
+				}
+				afterId = String(page.at(-1)?.[idColumn]);
+			}
+		}
 		const fetchPage = async (
 			afterUpdatedAt?: string,
 			equalUpdatedAt?: string,

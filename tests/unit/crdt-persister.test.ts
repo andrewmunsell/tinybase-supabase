@@ -231,6 +231,7 @@ const configuration = (client: MemorySupabase, databaseName: string) => ({
 			crdtRowIdColumn: 'document_id',
 			crdtUpdatesTable: 'document_yjs_updates',
 			table: 'documents',
+			updatedAtColumn: 'updated_at',
 		},
 	},
 });
@@ -327,7 +328,10 @@ describe('createSupabasePersister with CRDT cells', () => {
 		client.channels
 			.find(({ active, filter }) => active && filter.table === 'document_yjs_updates')
 			?.callback();
-		await new Promise((resolve) => setTimeout(resolve, 250));
+		await waitFor(
+			() => readerStore.getCell('documents', 'doc-1', 'body') === 'Remote update',
+			'Read-only CRDT update was not reconciled',
+		);
 		expect(readerStore.getCell('documents', 'doc-1', 'body')).toBe('Remote update');
 
 		expect(() => readerRow.getText('body').insert(0, 'Local ')).toThrow('is read-only');
@@ -565,9 +569,10 @@ describe('createSupabasePersister with CRDT cells', () => {
 		expect(client.rows.get('document_yjs_updates')).toHaveLength(0);
 		await new Promise((resolve) => setTimeout(resolve, 10));
 		expect(client.rows.get('document_yjs_updates')).toHaveLength(0);
-		await new Promise((resolve) => setTimeout(resolve, 30));
-
-		expect(client.rows.get('document_yjs_updates')).toHaveLength(1);
+		await waitFor(
+			() => client.rows.get('document_yjs_updates')?.length === 1,
+			'Buffered CRDT update was not uploaded',
+		);
 		expect(persister.getSyncStatus().pendingCount).toBe(0);
 		const receiverStore = createStore().setRow('documents', 'doc-1', { owner_id: 'user' });
 		const receiver = await createSupabasePersister(
@@ -622,7 +627,10 @@ describe('createSupabasePersister with CRDT cells', () => {
 		first.getMap<string>('properties').set('source', 'first');
 		second.getText('body').insert(0, 'two');
 		second.getArray<string>('items').push(['second']);
-		await new Promise((resolve) => setTimeout(resolve, 40));
+		await waitFor(
+			() => client.rows.get('document_yjs_updates')?.length === 2,
+			'Buffered CRDT updates were not uploaded',
+		);
 
 		const updates = client.rows.get('document_yjs_updates') ?? [];
 		expect(updates).toHaveLength(2);
@@ -957,12 +965,13 @@ describe('createSupabasePersister with CRDT cells', () => {
 
 		await persister.startSyncing();
 		const opening = persister.openRow('documents', 'doc-1');
-		await tick();
-		expect(
-			client.channels.some(
-				({ active, filter }) => active && filter.table === 'document_yjs_updates',
-			),
-		).toBe(true);
+		await waitFor(
+			() =>
+				client.channels.some(
+					({ active, filter }) => active && filter.table === 'document_yjs_updates',
+				),
+			'CRDT realtime subscription did not start',
+		);
 
 		await persister.stopSyncing();
 		await expect(opening).resolves.toBeDefined();
@@ -1018,9 +1027,10 @@ describe('createSupabasePersister with CRDT cells', () => {
 
 		firstRow.getText('body').insert(0, 'Recovered by poll');
 		await tick();
-		await new Promise((resolve) => setTimeout(resolve, 50));
-
-		expect(secondStore.getCell('documents', 'doc-1', 'body')).toBe('Recovered by poll');
+		await waitFor(
+			() => secondStore.getCell('documents', 'doc-1', 'body') === 'Recovered by poll',
+			'CRDT update was not recovered by the safety poll',
+		);
 		await first.destroy();
 		await second.destroy();
 	});
@@ -1077,7 +1087,10 @@ describe('createSupabasePersister with CRDT cells', () => {
 		);
 
 		client.errors.delete('document_yjs_updates');
-		await new Promise((resolve) => setTimeout(resolve, 20));
+		await waitFor(() => {
+			const status = persister.getSyncStatus();
+			return status.pendingCount === 0 && status.phase === 'idle';
+		}, 'CRDT retry did not return to idle');
 		expect(persister.getSyncStatus()).toMatchObject({ pendingCount: 0, phase: 'idle' });
 		expect(client.rows.get('document_yjs_updates')).toHaveLength(1);
 		expect(statuses).toEqual(
