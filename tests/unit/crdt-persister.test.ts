@@ -15,11 +15,11 @@ type ChannelRecord = {
 
 class Query implements PromiseLike<{ data: RemoteRow[]; error: RemoteError | null }> {
 	readonly #error: RemoteError | undefined;
+	readonly #filters: Array<(row: RemoteRow) => boolean> = [];
+	readonly #orders: string[] = [];
 	readonly #rows: RemoteRow[];
-	#column?: string;
 	#from = 0;
 	#to = Number.POSITIVE_INFINITY;
-	#value?: string;
 
 	constructor(rows: RemoteRow[], error?: RemoteError) {
 		this.#rows = rows;
@@ -27,12 +27,27 @@ class Query implements PromiseLike<{ data: RemoteRow[]; error: RemoteError | nul
 	}
 
 	eq(column: string, value: string): Query {
-		this.#column = column;
-		this.#value = value;
+		this.#filters.push((row) => String(row[column]) === value);
 		return this;
 	}
 
-	order(_column: string): Query {
+	gte(column: string, value: string): Query {
+		this.#filters.push((row) => String(row[column]) >= value);
+		return this;
+	}
+
+	gt(column: string, value: string): Query {
+		this.#filters.push((row) => String(row[column]) > value);
+		return this;
+	}
+
+	limit(count: number): Query {
+		this.#to = this.#from + count - 1;
+		return this;
+	}
+
+	order(column: string): Query {
+		this.#orders.push(column);
 		return this;
 	}
 
@@ -52,11 +67,18 @@ class Query implements PromiseLike<{ data: RemoteRow[]; error: RemoteError | nul
 			| null,
 		onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null,
 	): PromiseLike<TResult1 | TResult2> {
-		const filtered = this.#column
-			? this.#rows.filter((row) => String(row[this.#column as string]) === this.#value)
-			: this.#rows;
+		const filtered = this.#rows.filter((row) => this.#filters.every((filter) => filter(row)));
+		const ordered = [...filtered].sort((left, right) => {
+			for (const column of this.#orders) {
+				const comparison = String(left[column]).localeCompare(String(right[column]));
+				if (comparison !== 0) {
+					return comparison;
+				}
+			}
+			return 0;
+		});
 		return Promise.resolve({
-			data: filtered.slice(this.#from, this.#to + 1),
+			data: ordered.slice(this.#from, this.#to + 1),
 			error: this.#error ?? null,
 		}).then(onfulfilled, onrejected);
 	}
@@ -71,7 +93,13 @@ class MemorySupabase {
 	readonly selectErrors = new Map<string, RemoteError>();
 	readonly subscriptionCallbacks = new Map<string, Array<(status: string) => void>>();
 	readonly subscriptionStatuses = new Map<string, string>();
+	#timestamp = 0;
 	onSubscribe?: (record: (typeof this.channels)[number]) => void;
+
+	nextUpdatedAt(): string {
+		this.#timestamp += 1;
+		return `2026-07-14T00:00:00.${String(this.#timestamp).padStart(6, '0')}+00:00`;
+	}
 
 	channel(name: string) {
 		let record: ChannelRecord | undefined;
@@ -118,8 +146,14 @@ class MemorySupabase {
 				}
 				return { data: null, error: null };
 			},
-			select: (_columns: string) => {
+			select: (columns: string) => {
 				this.selectCounts.set(table, (this.selectCounts.get(table) ?? 0) + 1);
+				if (columns === '*') {
+					for (const row of rows) {
+						row.deleted_at ??= null;
+						row.updated_at ??= this.nextUpdatedAt();
+					}
+				}
 				return new Query(rows, this.selectErrors.get(table));
 			},
 			upsert: async (value: RemoteRow, options: { onConflict: string }) => {
@@ -131,9 +165,13 @@ class MemorySupabase {
 					(row) => row[options.onConflict] === value[options.onConflict],
 				);
 				if (index === -1) {
-					rows.push(value);
+					rows.push({ deleted_at: null, ...value, updated_at: this.nextUpdatedAt() });
 				} else {
-					rows[index] = { ...rows[index], ...value };
+					rows[index] = {
+						...rows[index],
+						...value,
+						updated_at: this.nextUpdatedAt(),
+					};
 				}
 				return { data: null, error: null };
 			},
@@ -155,6 +193,15 @@ class MemorySupabase {
 }
 
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+const waitFor = async (condition: () => boolean, message: string): Promise<void> => {
+	for (let attempt = 0; attempt < 100; attempt += 1) {
+		if (condition()) {
+			return;
+		}
+		await new Promise((resolve) => setTimeout(resolve, 2));
+	}
+	throw new Error(message);
+};
 const waitForSyncPhase = async (
 	persister: { getSyncStatus(): { phase: string } },
 	phase: string,
@@ -204,7 +251,9 @@ describe('createSupabasePersister with CRDT cells', () => {
 		await persister.save();
 		await persister.syncNow();
 
-		expect(client.rows.get('todos')).toContainEqual({ id: 'todo-1', title: 'Ordinary' });
+		expect(client.rows.get('todos')).toContainEqual(
+			expect.objectContaining({ id: 'todo-1', title: 'Ordinary' }),
+		);
 		expect(client.rows.has('document_yjs_updates')).toBe(false);
 		await expect(persister.openRow('todos', 'todo-1')).rejects.toThrow(
 			'no configured CRDT cells',
@@ -232,10 +281,12 @@ describe('createSupabasePersister with CRDT cells', () => {
 		await tick();
 		await persister.syncNow();
 
-		expect(client.rows.get('audit_logs')).toContainEqual({
-			action: 'created',
-			id: 'log-1',
-		});
+		expect(client.rows.get('audit_logs')).toContainEqual(
+			expect.objectContaining({
+				action: 'created',
+				id: 'log-1',
+			}),
+		);
 		expect(store.getCell('documents', 'doc-1', 'body')).toBe('Hybrid');
 		expect(client.rows.get('document_yjs_updates')).toHaveLength(1);
 		await persister.destroy();
@@ -285,7 +336,9 @@ describe('createSupabasePersister with CRDT cells', () => {
 		await reader.syncNow();
 		expect(reader.getSyncStatus().pendingCount).toBe(0);
 		expect(client.rows.get('document_yjs_updates')).toHaveLength(2);
-		expect(client.rows.get('documents')).toEqual([{ id: 'doc-1', owner_id: 'owner' }]);
+		expect(client.rows.get('documents')).toEqual([
+			expect.objectContaining({ id: 'doc-1', owner_id: 'owner' }),
+		]);
 
 		const localState = await CrdtLocalState.open(databaseName, 'user');
 		await expect(localState.getBuffered()).resolves.toHaveLength(0);
@@ -802,6 +855,7 @@ describe('createSupabasePersister with CRDT cells', () => {
 
 	it('debounces parent and CRDT realtime events through one reconciliation pass', async () => {
 		const client = new MemorySupabase();
+		client.rows.set('documents', [{ id: 'doc-1', owner_id: 'user' }]);
 		const store = createStore().setRow('documents', 'doc-1', { owner_id: 'user' });
 		const persister = await createSupabasePersister(store, {
 			...configuration(client, `debounce-${crypto.randomUUID()}`),
@@ -818,9 +872,13 @@ describe('createSupabasePersister with CRDT cells', () => {
 
 		client.channels.find(({ filter }) => filter.table === 'documents')?.callback();
 		client.channels.find(({ filter }) => filter.table === 'document_yjs_updates')?.callback();
-		await new Promise((resolve) => setTimeout(resolve, 40));
+		await waitFor(
+			() => client.selectCounts.get('document_yjs_updates') === 1,
+			'Reconciliation did not pull the CRDT updates table',
+		);
 
-		expect(client.selectCounts.get('documents')).toBe(1);
+		// One parent reconciliation uses keyset queries for the page, timestamp tie, and EOF.
+		expect(client.selectCounts.get('documents')).toBe(3);
 		expect(client.selectCounts.get('document_yjs_updates')).toBe(1);
 		await persister.destroy();
 	});
@@ -942,6 +1000,7 @@ describe('createSupabasePersister with CRDT cells', () => {
 
 	it('uses the shared safety poll to recover CRDT updates without realtime', async () => {
 		const client = new MemorySupabase();
+		client.rows.set('documents', [{ id: 'doc-1', owner_id: 'user' }]);
 		const firstStore = createStore().setRow('documents', 'doc-1', { owner_id: 'user' });
 		const secondStore = createStore().setRow('documents', 'doc-1', { owner_id: 'user' });
 		const first = await createSupabasePersister(firstStore, {
@@ -1009,8 +1068,13 @@ describe('createSupabasePersister with CRDT cells', () => {
 		client.errors.set('document_yjs_updates', { message: 'network unavailable', status: 503 });
 		row.getText('body').insert(0, 'Retry');
 		await tick();
-		await new Promise((resolve) => setTimeout(resolve, 5));
-		expect(persister.getSyncStatus()).toMatchObject({ pendingCount: 1, phase: 'offline' });
+		await waitFor(
+			() =>
+				statuses.some(
+					({ pendingCount, phase }) => pendingCount === 1 && phase === 'offline',
+				),
+			'CRDT transport failure was not reported as offline',
+		);
 
 		client.errors.delete('document_yjs_updates');
 		await new Promise((resolve) => setTimeout(resolve, 20));

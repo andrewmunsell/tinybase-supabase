@@ -1,6 +1,6 @@
 import type { Content, Store, Table, Tables } from 'tinybase';
 import { createCustomPersister, type Persister } from 'tinybase/persisters';
-import { LocalState, type PendingOperation } from './storage.js';
+import { LocalState, type PendingOperation, type SyncCursor } from './storage.js';
 import type { SyncScheduler } from './sync-scheduler.js';
 import {
 	asError,
@@ -20,7 +20,6 @@ import type {
 	RejectedOperation,
 	SupabasePersister,
 	SupabasePersisterConfig,
-	SupabaseRow,
 	SyncPhase,
 	SyncStatus,
 } from './types.js';
@@ -39,6 +38,7 @@ export type StandardPersister = Omit<
 
 const defaultPageSize = 500;
 const defaultPollIntervalMs = 60_000;
+const defaultCursorLookbackMs = 5 * 60_000;
 const defaultRetryBaseDelayMs = 1_000;
 const defaultRetryMaxDelayMs = 30_000;
 
@@ -51,8 +51,9 @@ export const createStandardPersister = async (
 	config: SupabasePersisterConfig,
 	scheduler: SyncScheduler,
 ): Promise<StandardPersister> => {
-	const state = await LocalState.open(config.databaseName, config.scopeKey);
+	const state = await LocalState.open(config.databaseName, config.scopeKey, config.onError);
 	const pageSize = config.pageSize ?? defaultPageSize;
+	const cursorLookbackMs = Math.max(0, config.cursorLookbackMs ?? defaultCursorLookbackMs);
 	const transport = new StandardTransport(config.supabase, pageSize);
 	const retryBaseDelayMs = config.retryBaseDelayMs ?? defaultRetryBaseDelayMs;
 	const retryMaxDelayMs = config.retryMaxDelayMs ?? defaultRetryMaxDelayMs;
@@ -94,8 +95,12 @@ export const createStandardPersister = async (
 	const createOperations = (content: Content): PendingOperation[] =>
 		createPendingOperations(store, lastContent, content, tableConfigs);
 
-	const applyRemoteContent = async (content: Content): Promise<void> => {
-		await state.replaceContent(content);
+	const applyRemoteContent = async (
+		content: Content,
+		cursorKey: string,
+		cursor?: SyncCursor,
+	): Promise<void> => {
+		await state.replaceContent(content, cursorKey, cursor);
 		lastContent = cloneContent(content);
 		listener?.(content);
 	};
@@ -106,18 +111,36 @@ export const createStandardPersister = async (
 			return;
 		}
 
-		const rows: SupabaseRow[] = await transport.fetchRows(tableConfig);
+		const cursorKey = JSON.stringify([
+			tableId,
+			tableConfig.table,
+			tableConfig.idColumn ?? 'id',
+			tableConfig.deletedAtColumn ?? 'deleted_at',
+			tableConfig.updatedAtColumn ?? 'updated_at',
+			tableConfig.select ?? '*',
+			tableConfig.cursorVersion ?? '',
+		]);
+		const cursor = await state.getCursor(cursorKey);
+		const cursorTime = cursor ? Date.parse(cursor.updatedAt) : Number.NaN;
+		const pullCursor =
+			cursor && cursorLookbackMs > 0 && Number.isFinite(cursorTime)
+				? { updatedAt: new Date(cursorTime - cursorLookbackMs).toISOString() }
+				: cursor;
+		const { cursor: pulledCursor, rows } = await transport.fetchRows(tableConfig, pullCursor);
+		const pulledCursorTime = Date.parse(pulledCursor.updatedAt);
+		const nextCursor = cursor && pulledCursorTime <= cursorTime ? cursor : pulledCursor;
 
 		const content = cloneContent((await state.getContent()) ?? lastContent);
 		const table: Table = { ...getRows(content, tableId) };
-		const pendingIds = new Set((await state.getOperations()).map((operation) => operation.id));
+		const [pending, rejected] = await Promise.all([state.getOperations(), state.getRejected()]);
+		const blockedIds = new Set([...pending, ...rejected].map((operation) => operation.id));
 		const seen = new Set<string>();
 		const deletedAtColumn = tableConfig.deletedAtColumn ?? 'deleted_at';
 
 		for (const remote of rows) {
 			const [rowId, row] = fromRemote(tableConfig, remote);
 			seen.add(rowId);
-			if (pendingIds.has(operationId(tableId, rowId))) {
+			if (blockedIds.has(operationId(tableId, rowId))) {
 				continue;
 			}
 			if (remote[deletedAtColumn] !== null && remote[deletedAtColumn] !== undefined) {
@@ -127,14 +150,21 @@ export const createStandardPersister = async (
 			}
 		}
 
-		for (const rowId of Object.keys(table)) {
-			if (!seen.has(rowId) && !pendingIds.has(operationId(tableId, rowId))) {
-				delete table[rowId];
+		if (!cursor) {
+			for (const rowId of Object.keys(table)) {
+				if (!seen.has(rowId) && !blockedIds.has(operationId(tableId, rowId))) {
+					delete table[rowId];
+				}
 			}
 		}
 
-		const tables: Tables = { ...content[0], [tableId]: table };
-		await applyRemoteContent([tables, content[1]]);
+		const tables: Tables = { ...content[0] };
+		if (Object.keys(table).length === 0) {
+			delete tables[tableId];
+		} else {
+			tables[tableId] = table;
+		}
+		await applyRemoteContent([tables, content[1]], cursorKey, nextCursor);
 	};
 
 	const flushOutbox = async (): Promise<void> => {

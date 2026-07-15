@@ -1,8 +1,8 @@
 # Configuration
 
 Each `tables` key is a TinyBase table Id. Its `table` value is the remote
-Supabase table. The default primary key is `id`, and the default tombstone
-column is `deleted_at`.
+Supabase table. The default primary key is `id`, the default tombstone column is
+`deleted_at`, and the default incremental cursor column is `updated_at`.
 
 Collaborative cells are configured on the same table mapping with `crdtCells`,
 `crdtUpdatesTable`, and optionally `crdtRowIdColumn`. Omit `crdtCells` for the
@@ -13,6 +13,11 @@ for the complete update-table and RLS contract.
 merged per row before upload. It defaults to `500`; set it to `0` for immediate
 upload. Local durability is not delayed.
 
+Parent-row cursors overlap by `cursorLookbackMs` (five minutes by default) to
+recover short transactions that commit out of timestamp order. Set a table's
+`cursorVersion` to a new stable value after changing its remote projection or
+codec so the next synchronization performs a full pull for that mapping.
+
 ```ts
 tables: {
 	projects: {
@@ -22,6 +27,8 @@ tables: {
 		dependsOn: ['projects'],
 		idColumn: 'id',
 		deletedAtColumn: 'deleted_at',
+		updatedAtColumn: 'updated_at',
+		cursorVersion: 'v1',
 		table: 'todos',
 	},
 	publicTemplates: {

@@ -29,5 +29,5 @@ const persister = await createSupabasePersister(store, {
 await persister.startAutoPersisting();
 ```
 
-`scopeKey` must change when the signed-in account or tenant changes. It keeps
-their browser persistence and outbox separate.
+`scopeKey` must change when the signed-in account, tenant, or authorization
+version changes. It keeps each visible row set and outbox separate.

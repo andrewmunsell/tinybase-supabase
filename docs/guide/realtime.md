@@ -18,5 +18,7 @@ For tables with CRDT cells, add both the parent table and the configured
 created lazily for open rows and filtered by `crdtRowIdColumn`.
 
 Startup, focus, reconnect, periodic, and manual synchronization use the same
-full reconciliation path. They remain authoritative for missed events,
-deletions, and authorization changes even when Realtime is disabled.
+cursor-based reconciliation path. The initial pull is a full authoritative
+snapshot; later pulls fetch rows at or after the stored `updated_at` watermark.
+Realtime remains a wake-up hint, while cursor pulls recover missed events and
+soft-delete tombstones within the configured cursor lookback window.

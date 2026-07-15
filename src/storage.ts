@@ -13,10 +13,18 @@ export interface RejectedRecord extends PendingOperation {
 	readonly error: string;
 }
 
+export interface SyncCursor {
+	readonly updatedAt: string;
+}
+
 interface PersisterDatabase extends DBSchema {
 	content: {
 		key: 'store';
 		value: Content;
+	};
+	cursors: {
+		key: string;
+		value: SyncCursor;
 	};
 	outbox: {
 		key: string;
@@ -28,7 +36,7 @@ interface PersisterDatabase extends DBSchema {
 	};
 }
 
-const databaseVersion = 1;
+const databaseVersion = 2;
 
 export class LocalState {
 	readonly #database: IDBPDatabase<PersisterDatabase>;
@@ -37,15 +45,31 @@ export class LocalState {
 		this.#database = database;
 	}
 
-	static async open(databaseName: string, scopeKey: string): Promise<LocalState> {
+	static async open(
+		databaseName: string,
+		scopeKey: string,
+		onBlocked?: (error: Error) => void,
+	): Promise<LocalState> {
 		const database = await openDB<PersisterDatabase>(
 			`${databaseName}:${scopeKey}`,
 			databaseVersion,
 			{
-				upgrade(upgradeDatabase) {
-					upgradeDatabase.createObjectStore('content');
-					upgradeDatabase.createObjectStore('outbox');
-					upgradeDatabase.createObjectStore('rejected');
+				blocked() {
+					onBlocked?.(
+						new Error(
+							`IndexedDB upgrade blocked for ${databaseName}:${scopeKey}; reload other tabs using this scope`,
+						),
+					);
+				},
+				upgrade(upgradeDatabase, oldVersion) {
+					if (oldVersion < 1) {
+						upgradeDatabase.createObjectStore('content');
+						upgradeDatabase.createObjectStore('outbox');
+						upgradeDatabase.createObjectStore('rejected');
+					}
+					if (oldVersion < 2) {
+						upgradeDatabase.createObjectStore('cursors');
+					}
 				},
 			},
 		);
@@ -59,6 +83,10 @@ export class LocalState {
 
 	async getContent(): Promise<Content | undefined> {
 		return this.#database.get('content', 'store');
+	}
+
+	async getCursor(cursorKey: string): Promise<SyncCursor | undefined> {
+		return this.#database.get('cursors', cursorKey);
 	}
 
 	async getOperations(): Promise<PendingOperation[]> {
@@ -84,8 +112,13 @@ export class LocalState {
 		await transaction.done;
 	}
 
-	async replaceContent(content: Content): Promise<void> {
-		await this.#database.put('content', content, 'store');
+	async replaceContent(content: Content, cursorKey: string, cursor?: SyncCursor): Promise<void> {
+		const transaction = this.#database.transaction(['content', 'cursors'], 'readwrite');
+		await transaction.objectStore('content').put(content, 'store');
+		if (cursor) {
+			await transaction.objectStore('cursors').put(cursor, cursorKey);
+		}
+		await transaction.done;
 	}
 
 	async reject(operation: PendingOperation, error: string): Promise<void> {

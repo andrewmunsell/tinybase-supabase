@@ -23,6 +23,10 @@ export interface SupabaseTableConfig {
 	readonly idColumn?: string;
 	/** Existing nullable timestamp column used for durable soft deletes. */
 	readonly deletedAtColumn?: string;
+	/** Existing server-managed timestamp column used for incremental pulls. Defaults to updated_at. */
+	readonly updatedAtColumn?: string;
+	/** Stable version for the remote mapping. Change it to force a new full pull. */
+	readonly cursorVersion?: string;
 	/** Parent TinyBase tables which must be uploaded before this table. */
 	readonly dependsOn?: readonly string[];
 	/** Columns to select during reconciliation. Defaults to `*`. */
@@ -58,6 +62,8 @@ export interface SupabasePersisterConfig {
 	readonly pollIntervalMs?: number;
 	/** Maximum rows fetched per Supabase page. Defaults to 500. */
 	readonly pageSize?: number;
+	/** Cursor overlap used to recover transactions that commit out of timestamp order. Defaults to 5 minutes. */
+	readonly cursorLookbackMs?: number;
 	/** Time to buffer and merge local Yjs updates before upload. Defaults to 500 ms. */
 	readonly crdtUpdateBufferMs?: number;
 	/** Initial retry delay after a transient network failure. Defaults to 1 second. */

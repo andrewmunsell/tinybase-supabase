@@ -63,7 +63,8 @@ export const getStandardConfig = (config: SupabasePersisterConfig): SupabasePers
 									Object.entries(remote).filter(
 										([column]) =>
 											column !== (table.idColumn ?? 'id') &&
-											column !== (table.deletedAtColumn ?? 'deleted_at'),
+											column !== (table.deletedAtColumn ?? 'deleted_at') &&
+											column !== (table.updatedAtColumn ?? 'updated_at'),
 									),
 								) as Row,
 							] as const);
