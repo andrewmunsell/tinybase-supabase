@@ -21,13 +21,22 @@ const persister = await createSupabasePersister(store, {
 	scopeKey: user.id,
 	supabase,
 	tables: {
-		projects: {table: 'projects'},
-		todos: {dependsOn: ['projects'], realtime: true, table: 'todos'},
+		projects: {table: 'projects', updatedAtColumn: 'updated_at'},
+		todos: {
+			dependsOn: ['projects'],
+			realtime: true,
+			table: 'todos',
+			updatedAtColumn: 'updated_at',
+		},
 	},
 });
 
 await persister.startAutoPersisting();
 ```
 
-`scopeKey` must change when the signed-in account or tenant changes. It keeps
-their browser persistence and outbox separate.
+`scopeKey` must change when the signed-in account, tenant, or authorization
+version changes. It keeps each visible row set and outbox separate.
+
+`updatedAtColumn` is optional for backward compatibility. We strongly recommend
+the shown server-managed timestamp configuration; omitting it makes every
+reconciliation a paginated full authoritative pull.

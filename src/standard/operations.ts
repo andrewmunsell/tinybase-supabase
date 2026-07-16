@@ -25,9 +25,10 @@ export const fromRemote = (
 	}
 	const idColumn = config.idColumn ?? 'id';
 	const deletedAtColumn = config.deletedAtColumn ?? 'deleted_at';
+	const updatedAtColumn = config.updatedAtColumn;
 	const row: Row = {};
 	for (const [column, value] of Object.entries(remote)) {
-		if (column !== idColumn && column !== deletedAtColumn) {
+		if (column !== idColumn && column !== deletedAtColumn && column !== updatedAtColumn) {
 			row[column] = value as Row[string];
 		}
 	}

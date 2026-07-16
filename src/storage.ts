@@ -10,13 +10,22 @@ export interface PendingOperation {
 }
 
 export interface RejectedRecord extends PendingOperation {
+	readonly discarded?: true;
 	readonly error: string;
+}
+
+export interface SyncCursor {
+	readonly updatedAt: string;
 }
 
 interface PersisterDatabase extends DBSchema {
 	content: {
 		key: 'store';
 		value: Content;
+	};
+	cursors: {
+		key: string;
+		value: SyncCursor;
 	};
 	outbox: {
 		key: string;
@@ -28,7 +37,7 @@ interface PersisterDatabase extends DBSchema {
 	};
 }
 
-const databaseVersion = 1;
+const databaseVersion = 2;
 
 export class LocalState {
 	readonly #database: IDBPDatabase<PersisterDatabase>;
@@ -37,15 +46,31 @@ export class LocalState {
 		this.#database = database;
 	}
 
-	static async open(databaseName: string, scopeKey: string): Promise<LocalState> {
+	static async open(
+		databaseName: string,
+		scopeKey: string,
+		onBlocked?: (error: Error) => void,
+	): Promise<LocalState> {
 		const database = await openDB<PersisterDatabase>(
 			`${databaseName}:${scopeKey}`,
 			databaseVersion,
 			{
-				upgrade(upgradeDatabase) {
-					upgradeDatabase.createObjectStore('content');
-					upgradeDatabase.createObjectStore('outbox');
-					upgradeDatabase.createObjectStore('rejected');
+				blocked() {
+					onBlocked?.(
+						new Error(
+							`IndexedDB upgrade blocked for ${databaseName}:${scopeKey}; reload other tabs using this scope`,
+						),
+					);
+				},
+				upgrade(upgradeDatabase, oldVersion) {
+					if (oldVersion < 1) {
+						upgradeDatabase.createObjectStore('content');
+						upgradeDatabase.createObjectStore('outbox');
+						upgradeDatabase.createObjectStore('rejected');
+					}
+					if (oldVersion < 2) {
+						upgradeDatabase.createObjectStore('cursors');
+					}
 				},
 			},
 		);
@@ -61,11 +86,19 @@ export class LocalState {
 		return this.#database.get('content', 'store');
 	}
 
+	async getCursor(cursorKey: string): Promise<SyncCursor | undefined> {
+		return this.#database.get('cursors', cursorKey);
+	}
+
 	async getOperations(): Promise<PendingOperation[]> {
 		return this.#database.getAll('outbox');
 	}
 
 	async getRejected(): Promise<RejectedRecord[]> {
+		return (await this.#database.getAll('rejected')).filter(({ discarded }) => !discarded);
+	}
+
+	async getBlockedOperations(): Promise<RejectedRecord[]> {
 		return this.#database.getAll('rejected');
 	}
 
@@ -74,18 +107,27 @@ export class LocalState {
 	}
 
 	async persist(content: Content, operations: readonly PendingOperation[]): Promise<void> {
-		const transaction = this.#database.transaction(['content', 'outbox'], 'readwrite');
+		const transaction = this.#database.transaction(
+			['content', 'outbox', 'rejected'],
+			'readwrite',
+		);
 		await transaction.objectStore('content').put(content, 'store');
 
 		for (const operation of operations) {
 			await transaction.objectStore('outbox').put(operation, operation.id);
+			await transaction.objectStore('rejected').delete(operation.id);
 		}
 
 		await transaction.done;
 	}
 
-	async replaceContent(content: Content): Promise<void> {
-		await this.#database.put('content', content, 'store');
+	async replaceContent(content: Content, cursorKey: string, cursor?: SyncCursor): Promise<void> {
+		const transaction = this.#database.transaction(['content', 'cursors'], 'readwrite');
+		await transaction.objectStore('content').put(content, 'store');
+		if (cursor) {
+			await transaction.objectStore('cursors').put(cursor, cursorKey);
+		}
+		await transaction.done;
 	}
 
 	async reject(operation: PendingOperation, error: string): Promise<void> {
@@ -97,10 +139,12 @@ export class LocalState {
 
 	async retryRejected(): Promise<void> {
 		const transaction = this.#database.transaction(['outbox', 'rejected'], 'readwrite');
-		const rejected = await transaction.objectStore('rejected').getAll();
+		const rejected = (await transaction.objectStore('rejected').getAll()).filter(
+			({ discarded }) => !discarded,
+		);
 
 		for (const operation of rejected) {
-			const { error: _error, ...pending } = operation;
+			const { discarded: _discarded, error: _error, ...pending } = operation;
 			await transaction.objectStore('outbox').put(pending, pending.id);
 			await transaction.objectStore('rejected').delete(operation.id);
 		}
@@ -109,6 +153,13 @@ export class LocalState {
 	}
 
 	async discardRejected(): Promise<void> {
-		await this.#database.clear('rejected');
+		const transaction = this.#database.transaction('rejected', 'readwrite');
+		const store = transaction.objectStore('rejected');
+		for (const operation of await store.getAll()) {
+			if (!operation.discarded) {
+				await store.put({ ...operation, discarded: true }, operation.id);
+			}
+		}
+		await transaction.done;
 	}
 }

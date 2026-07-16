@@ -1,3 +1,4 @@
+import type { SyncCursor } from '../storage.js';
 import type { SupabaseRow, SupabaseTableConfig } from '../types.js';
 
 export interface SupabaseError {
@@ -12,8 +13,16 @@ interface SupabaseResponse {
 }
 
 interface SelectQuery extends PromiseLike<SupabaseResponse> {
+	eq(column: string, value: string): SelectQuery;
+	gt(column: string, value: string): SelectQuery;
+	gte(column: string, value: string): SelectQuery;
+	limit(count: number): SelectQuery;
 	order(column: string): SelectQuery;
-	range(from: number, to: number): SelectQuery;
+}
+
+export interface FetchRowsResult {
+	readonly cursor?: SyncCursor;
+	readonly rows: SupabaseRow[];
 }
 
 interface RealtimeChannel {
@@ -37,6 +46,7 @@ interface SupabaseClient {
 export type StandardRealtimeChannel = RealtimeChannel;
 
 const permanentPostgresErrorCodes = new Set(['22P02', '23503', '23505', '23514', '42501']);
+const initialCursor: SyncCursor = { updatedAt: '1970-01-01T00:00:00.000000+00:00' };
 export const isPermanentError = (error: SupabaseError): boolean =>
 	(error.status !== undefined && error.status >= 400 && error.status < 500) ||
 	(error.code !== undefined && permanentPostgresErrorCodes.has(error.code));
@@ -50,25 +60,105 @@ export class StandardTransport {
 		this.#pageSize = pageSize;
 	}
 
-	async fetchRows(config: SupabaseTableConfig): Promise<SupabaseRow[]> {
+	async fetchRows(config: SupabaseTableConfig, cursor?: SyncCursor): Promise<FetchRowsResult> {
 		const rows: SupabaseRow[] = [];
-		let from = 0;
-		while (true) {
-			const response = await this.#client
-				.from(config.table)
-				.select(config.select ?? '*')
-				.order(config.idColumn ?? 'id')
-				.range(from, from + this.#pageSize - 1);
+		const deletedAtColumn = config.deletedAtColumn ?? 'deleted_at';
+		const idColumn = config.idColumn ?? 'id';
+		const updatedAtColumn = config.updatedAtColumn;
+		if (!updatedAtColumn) {
+			let afterId: string | undefined;
+			while (true) {
+				let query = this.#client.from(config.table).select(config.select ?? '*');
+				if (afterId) {
+					query = query.gt(idColumn, afterId);
+				}
+				const response = await query.order(idColumn).limit(this.#pageSize);
+				if (response.error) {
+					throw response.error;
+				}
+				const page = Array.isArray(response.data) ? (response.data as SupabaseRow[]) : [];
+				for (const row of page) {
+					if (typeof row[idColumn] !== 'string' || !(deletedAtColumn in row)) {
+						throw new Error(
+							`Table ${config.table} must select ${idColumn} and ${deletedAtColumn}`,
+						);
+					}
+				}
+				rows.push(...page);
+				if (page.length === 0) {
+					return { rows };
+				}
+				afterId = String(page.at(-1)?.[idColumn]);
+			}
+		}
+		const fetchPage = async (
+			afterUpdatedAt?: string,
+			equalUpdatedAt?: string,
+			afterId?: string,
+			atOrAfterUpdatedAt?: string,
+		): Promise<SupabaseRow[]> => {
+			let query = this.#client.from(config.table).select(config.select ?? '*');
+			if (afterUpdatedAt) {
+				query = query.gt(updatedAtColumn, afterUpdatedAt);
+			}
+			if (atOrAfterUpdatedAt) {
+				query = query.gte(updatedAtColumn, atOrAfterUpdatedAt);
+			}
+			if (equalUpdatedAt) {
+				query = query.eq(updatedAtColumn, equalUpdatedAt);
+			}
+			if (afterId) {
+				query = query.gt(idColumn, afterId);
+			}
+			const response = await query
+				.order(updatedAtColumn)
+				.order(idColumn)
+				.limit(this.#pageSize);
 			if (response.error) {
 				throw response.error;
 			}
 			const page = Array.isArray(response.data) ? (response.data as SupabaseRow[]) : [];
-			rows.push(...page);
-			if (page.length < this.#pageSize) {
-				return rows;
+			for (const row of page) {
+				if (
+					typeof row[idColumn] !== 'string' ||
+					!(deletedAtColumn in row) ||
+					typeof row[updatedAtColumn] !== 'string' ||
+					!Number.isFinite(Date.parse(row[updatedAtColumn]))
+				) {
+					throw new Error(
+						`Table ${config.table} must select ${idColumn}, ${deletedAtColumn}, and ${updatedAtColumn}`,
+					);
+				}
 			}
-			from += this.#pageSize;
+			return page;
+		};
+
+		const drainTimestamp = async (updatedAt: string, afterId?: string): Promise<void> => {
+			let lastId = afterId;
+			while (true) {
+				const page = await fetchPage(undefined, updatedAt, lastId);
+				rows.push(...page);
+				if (page.length === 0) {
+					return;
+				}
+				lastId = String(page.at(-1)?.[idColumn]);
+			}
+		};
+
+		let page = await fetchPage(undefined, undefined, undefined, cursor?.updatedAt);
+		while (page.length > 0) {
+			rows.push(...page);
+			const last = page.at(-1) as SupabaseRow;
+			const afterUpdatedAt = String(last[updatedAtColumn]);
+			await drainTimestamp(afterUpdatedAt, String(last[idColumn]));
+			page = await fetchPage(afterUpdatedAt);
 		}
+
+		const last = rows.at(-1);
+		return {
+			cursor: last ? { updatedAt: String(last[updatedAtColumn]) } : (cursor ?? initialCursor),
+			rows,
+		};
 	}
 
 	async upsert(config: SupabaseTableConfig, payload: SupabaseRow): Promise<void> {

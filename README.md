@@ -43,13 +43,18 @@ const persister = await createSupabasePersister(store, {
 	scopeKey: 'current-user-id',
 	supabase,
 	tables: {
-		projects: {table: 'projects'},
+		projects: {table: 'projects', updatedAtColumn: 'updated_at'},
 		todos: {
 			dependsOn: ['projects'],
 			realtime: true,
 			table: 'todos',
+			updatedAtColumn: 'updated_at',
 		},
-		public_templates: {mode: 'read-only', table: 'public_templates'},
+		public_templates: {
+			mode: 'read-only',
+			table: 'public_templates',
+			updatedAtColumn: 'updated_at',
+		},
 	},
 });
 
@@ -71,10 +76,11 @@ options:
 | --- | --- | --- | --- |
 | `supabase` | Supabase client | Required | A browser client created with a publishable or anon key. Do not use a service-role client. |
 | `databaseName` | `string` | Required | Stable IndexedDB database name for this application. |
-| `scopeKey` | `string` | Required | Stable user or tenant identifier. It isolates one authenticated scope from another in IndexedDB. |
+| `scopeKey` | `string` | Required | Stable user, tenant, and authorization-version identifier. It isolates one visible row set from another in IndexedDB. |
 | `tables` | `Record<string, SupabaseTableConfig>` | Required | Mapped tables, keyed by TinyBase table ID. TinyBase tables omitted from this object remain local-only. |
 | `pollIntervalMs` | `number` | `60000` | Safety-pull interval in milliseconds. Set to `0` to disable interval pulls. |
 | `pageSize` | `number` | `500` | Maximum number of parent rows or CRDT update rows fetched per Supabase page. |
+| `cursorLookbackMs` | `number` | `300000` | Overlap before configured parent-row cursors. It recovers transactions that commit shortly out of timestamp order. |
 | `crdtUpdateBufferMs` | `number` | `500` | Time to buffer and merge local Yjs updates per row before upload. Set to `0` for immediate upload; local durability is not delayed. |
 | `retryBaseDelayMs` | `number` | `1000` | Initial delay for exponential retry after a transient synchronization failure. |
 | `retryMaxDelayMs` | `number` | `30000` | Maximum delay between retries after repeated transient failures. |
@@ -88,10 +94,12 @@ Each entry in `tables` supports these options:
 | `mode` | `'read-write' \| 'read-only'` | `'read-write'` | Read-only mappings pull remote rows but never enqueue or upload local ordinary or CRDT writes. |
 | `idColumn` | `string` | `'id'` | Existing remote primary-key column. IDs must be created by the application and are always added to outgoing rows. |
 | `deletedAtColumn` | `string` | `'deleted_at'` | Existing nullable timestamp column used for soft-delete tombstones. |
+| `updatedAtColumn` | `string` | None | Existing server-managed timestamp used as the incremental pull cursor. Strongly recommended; when omitted, every reconciliation performs a full authoritative pull. |
+| `cursorVersion` | `string` | `''` | Stable remote-mapping version. Change it after a `select`/codec migration to force a new full pull. |
 | `dependsOn` | `readonly string[]` | `[]` | TinyBase table IDs that must be uploaded before this table. Tombstones are sent in the reverse dependency order. |
-| `select` | `string` | `'*'` | Columns passed to Supabase `select()` during parent-row reconciliation. Include the configured ID and soft-delete columns. |
+| `select` | `string` | `'*'` | Columns passed to Supabase `select()` during parent-row reconciliation. Include the configured ID and soft-delete columns, plus the updated-at column when incremental pulls are enabled. |
 | `toRemote` | `(rowId: string, row: Row) => SupabaseRow` | Identity mapping | Encodes a TinyBase row for Supabase. The configured ID column is added after this function returns. |
-| `fromRemote` | `(row: SupabaseRow) => [string, Row]` | Default column mapping | Decodes a remote row. By default, the ID becomes the TinyBase row ID and the ID and soft-delete columns are omitted from its cells. |
+| `fromRemote` | `(row: SupabaseRow) => [string, Row]` | Default column mapping | Decodes a remote row. By default, the ID becomes the TinyBase row ID; the ID, soft-delete, and configured updated-at columns are omitted from its cells. |
 | `realtime` | `boolean \| RealtimeTableConfig` | `false` | Enables Postgres Changes as a debounced pull wake-up. Use `true` for the defaults or an object for the options below. |
 | `crdtCells` | `Record<string, CrdtCellConfig>` | `{}` | Collaborative cells keyed by TinyBase cell ID. Each value is `{type: 'text'}`, `{type: 'map'}`, `{type: 'array'}`, or `{type: 'xml-fragment'}`. |
 | `crdtUpdatesTable` | `string` | None | Append-only Yjs updates table. Required when `crdtCells` is non-empty. |
@@ -110,6 +118,7 @@ For example, a configuration using every option can look like this:
 ```ts
 const persister = await createSupabasePersister(store, {
 	crdtUpdateBufferMs: 250,
+	cursorLookbackMs: 300_000,
 	databaseName: 'my-app',
 	onError: (error) => console.error(error),
 	pageSize: 250,
@@ -119,7 +128,7 @@ const persister = await createSupabasePersister(store, {
 	scopeKey: user.id,
 	supabase,
 	tables: {
-		documents: {
+			documents: {
 			crdtCells: {
 				body: {type: 'text'},
 				metadata: {type: 'map'},
@@ -129,6 +138,8 @@ const persister = await createSupabasePersister(store, {
 			crdtRowIdColumn: 'document_id',
 			crdtUpdatesTable: 'document_yjs_updates',
 			deletedAtColumn: 'deleted_at',
+			cursorVersion: 'v1',
+			updatedAtColumn: 'updated_at',
 			dependsOn: ['projects'],
 			fromRemote: (row) => [String(row.id), {title: String(row.title)}],
 			idColumn: 'id',
@@ -137,14 +148,15 @@ const persister = await createSupabasePersister(store, {
 				channelName: `documents:${user.id}`,
 				debounceMs: 100,
 			},
-			select: 'id,title,deleted_at',
+			select: 'id,title,deleted_at,updated_at',
 			table: 'documents',
 			toRemote: (_rowId, row) => ({title: row.title}),
 		},
-		projects: {table: 'projects'},
+		projects: {table: 'projects', updatedAtColumn: 'updated_at'},
 		publicTemplates: {
 			mode: 'read-only',
 			table: 'public_templates',
+			updatedAtColumn: 'updated_at',
 		},
 	},
 });
@@ -159,10 +171,15 @@ the update table and policies described in the
 
 ## Database contract
 
-Every read-write mapping needs an application-created string or UUID primary
-key (default column: `id`) and a nullable soft-delete timestamp (default:
-`deleted_at`). The client never uses a service-role key. Enable RLS and grant
-only the operations your authenticated users need.
+Every mapping needs an application-created string or UUID primary key (default
+column: `id`) and a nullable soft-delete timestamp (default: `deleted_at`). We
+strongly recommend adding a non-null server-managed update timestamp, indexing
+it with the ID, and setting `updatedAtColumn: 'updated_at'`. This enables
+incremental pulls. Without that option, every reconciliation remains a paginated
+full authoritative pull for backward compatibility. Keep tombstones selectable
+for every scope that previously read the live row. The client never uses a
+service-role key. Enable RLS and grant only the operations your authenticated
+users need.
 
 Each TinyBase row maps to a whole remote row. Use `toRemote` and `fromRemote`
 for renamed columns or domain codecs. JSON values, arrays, nullable values,
@@ -191,6 +208,14 @@ During a CRDT retry, the document remains quarantined until the complete merged
 chain is accepted. A transient retry failure leaves that chain pending for the
 normal backoff scheduler instead of allowing newer updates to bypass it.
 
+Without `updatedAtColumn`, every pull is an automatically paginated,
+authoritative snapshot. When `updatedAtColumn` is configured, the first pull is
+authoritative and later pulls use the greatest server-returned timestamp with a
+five-minute overlap by default, so only recent and newer rows are transferred.
+Incremental mode requires durable soft-delete tombstones and stable RLS
+visibility for a `scopeKey`; include an authorization version in the scope
+whenever grants or revocations change its visible row set.
+
 Transient failures retry with capped exponential backoff. Sync also runs on
 browser reconnect and when a hidden tab becomes visible, in addition to the
 optional periodic safety pull.
@@ -206,9 +231,10 @@ collaboration-latency/row-count tradeoff, or call `syncNow()` to flush the
 current buffer immediately.
 
 With `realtime: true`, Postgres Changes only wakes a debounced authenticated
-pull. CRUD remains the write path, and startup, reconnect, manual, and safety
-pulls remain authoritative. Add opted-in tables to the `supabase_realtime`
-publication in your own schema.
+pull. CRUD remains the write path. Startup, reconnect, manual, and safety pulls
+use the configured durable cursor, or the full-pull fallback, rather than
+trusting notification delivery. Add opted-in tables to the
+`supabase_realtime` publication in your own schema.
 
 ## Local development and tests
 

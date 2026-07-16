@@ -44,6 +44,7 @@ const persister = await createSupabasePersister(store, {
 			crdtRowIdColumn: 'document_id',
 			crdtUpdatesTable: 'document_yjs_updates',
 			table: 'documents',
+			updatedAtColumn: 'updated_at',
 		},
 	},
 });
@@ -80,8 +81,9 @@ path.
 
 With `realtime` enabled, both parent-row and updates-table notifications feed a
 single debounced reconciliation scheduler. Polling, reconnect, tab visibility,
-and `syncNow()` use that same path, so a missed notification is recovered by a
-later safety synchronization.
+and `syncNow()` use that same path, so a missed notification can be recovered by
+a later cursor pull. If `updatedAtColumn` is omitted, parent-row reconciliation
+uses full pulls instead.
 
 Locally cached Yjs updates can be opened and edited when an authoritative pull
 fails transiently; the shared scheduler reports the offline state and retries.
@@ -102,8 +104,27 @@ create table public.documents (
 	owner_id uuid not null references auth.users (id),
 	workspace_id text not null references public.workspaces (id),
 	status text not null default 'draft',
-	deleted_at timestamptz
+	deleted_at timestamptz,
+	updated_at timestamptz not null default clock_timestamp()
 );
+
+create index documents_sync_cursor_idx
+	on public.documents (updated_at, id);
+
+create or replace function public.set_updated_at()
+returns trigger
+language plpgsql
+set search_path = ''
+as $$
+begin
+	new.updated_at = clock_timestamp();
+	return new;
+end;
+$$;
+
+create trigger documents_set_updated_at
+	before insert or update on public.documents
+	for each row execute function public.set_updated_at();
 
 create table public.document_yjs_updates (
 	id uuid primary key,
