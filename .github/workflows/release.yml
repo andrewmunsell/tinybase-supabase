@@ -6,11 +6,17 @@ on:
 
 permissions:
   contents: read
-  id-token: write
 
 jobs:
-  publish:
+  verify:
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    needs: verify
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v6
       - uses: pnpm/action-setup@v4
@@ -20,7 +26,5 @@ jobs:
           registry-url: https://registry.npmjs.org
       - run: npm install --global npm@11.5.1
       - run: pnpm install --frozen-lockfile
-      - run: pnpm check
-      - run: pnpm test:unit
       - run: pnpm build
       - run: npm publish
