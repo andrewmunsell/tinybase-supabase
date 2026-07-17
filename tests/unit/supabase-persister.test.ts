@@ -1,6 +1,12 @@
 import 'fake-indexeddb/auto';
+import { jest } from '@jest/globals';
+import { openDB } from 'idb';
 import { createStore } from 'tinybase';
-import { createSupabasePersister } from '../../src/index.js';
+import {
+	createSupabasePersister,
+	IndexedDbConnectionClosedForUpgradeError,
+} from '../../src/index.js';
+import { LocalState } from '../../src/storage.js';
 
 type RemoteRow = Record<string, unknown>;
 
@@ -85,12 +91,17 @@ class MemorySupabase {
 	readonly channels: Array<{ callback: () => void; table: string }> = [];
 	readonly cursorQueries: Array<{ column: string; table: string; value: string }> = [];
 	readonly rows = new Map<string, Map<string, RemoteRow>>();
+	removedChannelCount = 0;
 	#timestamp = 0;
 	#selectCount = 0;
 	onSelect?: (table: string, count: number) => void;
 	permanentError: { message: string; status: number } | undefined;
 	serverRowLimit = Number.POSITIVE_INFINITY;
 	transientError: { message: string; status: number } | undefined;
+
+	get selectCount(): number {
+		return this.#selectCount;
+	}
 
 	nextUpdatedAt(): string {
 		this.#timestamp += 1;
@@ -154,7 +165,9 @@ class MemorySupabase {
 		return channel;
 	}
 
-	removeChannel(): void {}
+	removeChannel(): void {
+		this.removedChannelCount += 1;
+	}
 }
 
 const configuration = (client: MemorySupabase, databaseName: string) => ({
@@ -185,6 +198,147 @@ const fullPullConfiguration = (client: MemorySupabase, databaseName: string) => 
 });
 
 describe('createSupabasePersister', () => {
+	it('normalizes an upgrade that closes IndexedDB during initialization', async () => {
+		const databaseName = `initialization-upgrade-${crypto.randomUUID()}`;
+		let releaseRead = (): void => undefined;
+		let reportReadStarted = (): void => undefined;
+		const readStarted = new Promise<void>((resolve) => {
+			reportReadStarted = resolve;
+		});
+		const readGate = new Promise<void>((resolve) => {
+			releaseRead = resolve;
+		});
+		const originalGetContent = LocalState.prototype.getContent;
+		const getContent = jest
+			.spyOn(LocalState.prototype, 'getContent')
+			.mockImplementation(async function (this: LocalState) {
+				reportReadStarted();
+				await readGate;
+				return originalGetContent.call(this);
+			});
+		let futureDatabase: Awaited<ReturnType<typeof openDB>> | undefined;
+		try {
+			const creation = createSupabasePersister(
+				createStore(),
+				configuration(new MemorySupabase(), databaseName),
+			);
+			await readStarted;
+			futureDatabase = await openDB(`${databaseName}:user-1`, 3);
+			releaseRead();
+			const persister = await creation;
+			const terminalStatus = persister.getSyncStatus();
+			const terminalError = terminalStatus.lastError;
+
+			expect(terminalStatus.phase).toBe('error');
+			expect(terminalError).toMatchObject({
+				code: 'indexeddb-connection-closed-for-upgrade',
+				currentVersion: 2,
+				requestedVersion: 3,
+			});
+			await expect(persister.save()).rejects.toBe(terminalError);
+			await persister.destroy();
+		} finally {
+			releaseRead();
+			futureDatabase?.close();
+			getContent.mockRestore();
+		}
+	});
+
+	it('preserves an unrelated initialization error that races with an upgrade', async () => {
+		const databaseName = `initialization-error-${crypto.randomUUID()}`;
+		const sentinel = new Error('Unrelated initialization failure');
+		let releaseRead = (): void => undefined;
+		let reportReadStarted = (): void => undefined;
+		const readStarted = new Promise<void>((resolve) => {
+			reportReadStarted = resolve;
+		});
+		const readGate = new Promise<void>((resolve) => {
+			releaseRead = resolve;
+		});
+		const getContent = jest
+			.spyOn(LocalState.prototype, 'getContent')
+			.mockImplementation(async () => {
+				reportReadStarted();
+				await readGate;
+				throw sentinel;
+			});
+		let futureDatabase: Awaited<ReturnType<typeof openDB>> | undefined;
+		try {
+			const creation = createSupabasePersister(
+				createStore(),
+				configuration(new MemorySupabase(), databaseName),
+			);
+			await readStarted;
+			futureDatabase = await openDB(`${databaseName}:user-1`, 3);
+			releaseRead();
+			await expect(creation).rejects.toBe(sentinel);
+		} finally {
+			releaseRead();
+			futureDatabase?.close();
+			getContent.mockRestore();
+		}
+	});
+
+	it('becomes terminal when its IndexedDB connection closes for a future upgrade', async () => {
+		const client = new MemorySupabase();
+		const databaseName = `terminal-upgrade-${crypto.randomUUID()}`;
+		const store = createStore();
+		const persister = await createSupabasePersister(store, {
+			...configuration(client, databaseName),
+			pollIntervalMs: 5,
+		});
+		await persister.startAutoPersisting();
+		expect(client.selectCount).toBeGreaterThan(0);
+		store.setRow('todos', 'persisted', { title: 'Persisted' });
+		await persister.save();
+		const statuses: Array<ReturnType<typeof persister.getSyncStatus>> = [];
+		persister.addSyncStatusListener((status) => statuses.push(status));
+
+		const futureDatabase = await openDB(`${databaseName}:user-1`, 3);
+		const terminalStatus = persister.getSyncStatus();
+		const terminalError = terminalStatus.lastError;
+
+		expect(terminalStatus.phase).toBe('error');
+		expect(terminalError).toBeInstanceOf(IndexedDbConnectionClosedForUpgradeError);
+		expect(terminalError).toMatchObject({
+			code: 'indexeddb-connection-closed-for-upgrade',
+			currentVersion: 2,
+			requestedVersion: 3,
+		});
+		expect(statuses.at(-1)?.lastError).toBe(terminalError);
+		expect(statuses.at(-1)?.phase).toBe('error');
+		expect(persister.isAutoSaving()).toBe(false);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(client.removedChannelCount).toBe(1);
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		const selectCountAfterTermination = client.selectCount;
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		expect(client.selectCount).toBe(selectCountAfterTermination);
+
+		store.setRow('todos', 'unpersisted', { title: 'Must not persist' });
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(await futureDatabase.get('content', 'store')).toEqual([
+			{ todos: { persisted: { title: 'Persisted' } } },
+			{},
+		]);
+
+		for (const operation of [
+			persister.load(),
+			persister.save(),
+			persister.syncNow(),
+			persister.startSyncing(),
+			persister.startAutoPersisting(),
+			persister.retryRejected(),
+			persister.discardRejected(),
+			persister.getRejectedOperations(),
+		]) {
+			await expect(operation).rejects.toBe(terminalError);
+		}
+
+		futureDatabase.close();
+		await persister.destroy();
+	});
+
 	it('persists offline rows, flushes them, and reconciles the remote snapshot', async () => {
 		const client = new MemorySupabase();
 		const store = createStore();

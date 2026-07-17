@@ -1,8 +1,9 @@
 import type { Store } from 'tinybase';
-import { createCrdtCoordinator, type CrdtCoordinator } from './crdt/coordinator.js';
 import { getConfiguredCrdtTables, getStandardConfig } from './crdt/config.js';
+import { type CrdtCoordinator, createCrdtCoordinator } from './crdt/coordinator.js';
 import { createShadowStoreBridge } from './crdt/shadow-store.js';
 import { createStandardPersister } from './create-standard-persister.js';
+import type { IndexedDbConnectionClosedForUpgradeError } from './indexeddb-errors.js';
 import { SyncScheduler } from './sync-scheduler.js';
 import type {
 	RejectedOperation,
@@ -21,11 +22,25 @@ export const createHybridPersister = async (
 	let coordinator: CrdtCoordinator | undefined;
 	let standard: Awaited<ReturnType<typeof createStandardPersister>>;
 	let result: SupabasePersister | undefined;
+	let terminalError: IndexedDbConnectionClosedForUpgradeError | undefined;
 	const statusListeners = new Set<(status: SyncStatus) => void>();
+	const notifyStatusListener = (
+		listener: (status: SyncStatus) => void,
+		status: SyncStatus,
+	): void => {
+		try {
+			listener(status);
+		} catch (error) {
+			try {
+				reportError(error instanceof Error ? error : new Error(String(error)));
+			} catch {}
+		}
+	};
 	const emitStatus = (): void => {
 		if (result) {
+			const status = result.getSyncStatus();
 			for (const listener of statusListeners) {
-				listener(result.getSyncStatus());
+				notifyStatusListener(listener, status);
 			}
 		}
 	};
@@ -50,10 +65,19 @@ export const createHybridPersister = async (
 		(tableId, rowId) => coordinator?.getProjection(tableId, rowId),
 		reportError,
 	);
+	const terminate = (error: IndexedDbConnectionClosedForUpgradeError): void => {
+		if (terminalError) {
+			return;
+		}
+		terminalError = error;
+		bridge.destroy();
+		coordinator?.terminate(error);
+	};
 	standard = await createStandardPersister(
 		bridge.shadowStore,
 		getStandardConfig(config),
 		scheduler,
+		terminate,
 	);
 	coordinator = await createCrdtCoordinator(
 		store,
@@ -62,12 +86,19 @@ export const createHybridPersister = async (
 		() => scheduler.runNow(),
 		(delayMs) => scheduler.schedule(delayMs),
 		emitStatus,
+		(error) => {
+			standard.terminate(error);
+			terminate(error);
+		},
 	);
+	if (terminalError) {
+		coordinator.terminate(terminalError);
+	}
 	const removeStandardStatusListener = standard.addSyncStatusListener(emitStatus);
 	result = Object.assign({}, standard, {
 		addSyncStatusListener(listener: (status: SyncStatus) => void): () => void {
 			statusListeners.add(listener);
-			listener(result?.getSyncStatus() ?? standard.getSyncStatus());
+			notifyStatusListener(listener, result?.getSyncStatus() ?? standard.getSyncStatus());
 			return () => statusListeners.delete(listener);
 		},
 		closeRow: coordinator.closeRow,

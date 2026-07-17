@@ -1,7 +1,9 @@
 import type { Content, Store, Table, Tables } from 'tinybase';
 import { createCustomPersister, type Persister } from 'tinybase/persisters';
-import { LocalState, type PendingOperation, type SyncCursor } from './storage.js';
-import type { SyncScheduler } from './sync-scheduler.js';
+import {
+	type IndexedDbConnectionClosedForUpgradeError,
+	isIndexedDbConnectionClosedException,
+} from './indexeddb-errors.js';
 import {
 	asError,
 	cloneContent,
@@ -13,9 +15,11 @@ import {
 } from './standard/operations.js';
 import {
 	isPermanentError,
-	StandardTransport,
 	type StandardRealtimeChannel,
+	StandardTransport,
 } from './standard/protocol.js';
+import { LocalState, type PendingOperation, type SyncCursor } from './storage.js';
+import type { SyncScheduler } from './sync-scheduler.js';
 import type {
 	RejectedOperation,
 	SupabasePersister,
@@ -28,12 +32,14 @@ export type StandardPersister = Omit<
 	SupabasePersister,
 	'closeRow' | 'destroy' | 'isRowOpen' | 'openRow' | 'startAutoPersisting'
 > & {
+	assertUsable(): void;
 	destroy(): Promise<StandardPersister>;
 	completeSync(): Promise<void>;
 	isRowBlocked(tableId: string, rowId: string): Promise<boolean>;
 	reconcile(markIdle?: boolean): Promise<boolean>;
 	reportSyncError(error: unknown): Promise<void>;
 	startAutoPersisting(): Promise<StandardPersister>;
+	terminate(error: IndexedDbConnectionClosedForUpgradeError): void;
 };
 
 const defaultPageSize = 500;
@@ -50,37 +56,118 @@ export const createStandardPersister = async (
 	store: Store,
 	config: SupabasePersisterConfig,
 	scheduler: SyncScheduler,
+	onTerminal?: (error: IndexedDbConnectionClosedForUpgradeError) => void,
 ): Promise<StandardPersister> => {
-	const state = await LocalState.open(config.databaseName, config.scopeKey, config.onError);
+	let handleConnectionClosedForUpgrade:
+		| ((error: IndexedDbConnectionClosedForUpgradeError) => void)
+		| undefined;
+	let pendingTerminalError: IndexedDbConnectionClosedForUpgradeError | undefined;
+	const state = await LocalState.open(
+		config.databaseName,
+		config.scopeKey,
+		config.onError,
+		(error) => {
+			if (handleConnectionClosedForUpgrade) {
+				handleConnectionClosedForUpgrade(error);
+			} else {
+				pendingTerminalError = error;
+			}
+		},
+	);
 	const pageSize = config.pageSize ?? defaultPageSize;
 	const cursorLookbackMs = Math.max(0, config.cursorLookbackMs ?? defaultCursorLookbackMs);
 	const transport = new StandardTransport(config.supabase, pageSize);
 	const retryBaseDelayMs = config.retryBaseDelayMs ?? defaultRetryBaseDelayMs;
 	const retryMaxDelayMs = config.retryMaxDelayMs ?? defaultRetryMaxDelayMs;
 	const tableConfigs = config.tables;
-	let lastContent = (await state.getContent()) ?? store.getContent();
+	const readDuringInitialization = async <Value>(
+		read: () => Promise<Value>,
+		fallback: Value,
+	): Promise<Value> => {
+		try {
+			const value = await read();
+			return pendingTerminalError ? fallback : value;
+		} catch (error) {
+			if (pendingTerminalError && isIndexedDbConnectionClosedException(error)) {
+				return fallback;
+			}
+			throw error;
+		}
+	};
+	const [initialContent, initialOperations, initialRejected] = await Promise.all([
+		readDuringInitialization(() => state.getContent(), undefined),
+		readDuringInitialization(() => state.getOperations(), []),
+		readDuringInitialization(() => state.getRejected(), []),
+	]);
+	let lastContent = initialContent ?? store.getContent();
 	let listener: ((content?: Content) => void) | undefined;
 	let isDestroyed = false;
 	let hasStartedSyncing = false;
 	let retryAttempt = 0;
+	let stopAutoPersistence: (() => Promise<unknown>) | undefined;
+	let terminalError: IndexedDbConnectionClosedForUpgradeError | undefined;
 	const channels: StandardRealtimeChannel[] = [];
 	const statusListeners = new Set<(status: SyncStatus) => void>();
 	let status: SyncStatus = {
-		pendingCount: (await state.getOperations()).length,
+		pendingCount: initialOperations.length,
 		phase: 'hydrating',
-		rejectedCount: (await state.getRejected()).length,
+		rejectedCount: initialRejected.length,
+	};
+
+	const reportListenerError = (error: unknown): void => {
+		try {
+			config.onError?.(asError(error));
+		} catch {}
+	};
+
+	const notifyStatusListener = (statusListener: (status: SyncStatus) => void): void => {
+		try {
+			statusListener(status);
+		} catch (error) {
+			reportListenerError(error);
+		}
+	};
+
+	const emitStatus = (): void => {
+		for (const statusListener of statusListeners) {
+			notifyStatusListener(statusListener);
+		}
 	};
 
 	const setStatus = async (phase: SyncPhase, error?: Error): Promise<void> => {
-		status = {
+		if (terminalError) {
+			return;
+		}
+		const nextStatus: SyncStatus = {
 			lastError: error,
 			lastSuccessfulSyncAt: phase === 'idle' ? Date.now() : status.lastSuccessfulSyncAt,
 			pendingCount: (await state.getOperations()).length,
 			phase,
 			rejectedCount: (await state.getRejected()).length,
 		};
-		for (const statusListener of statusListeners) {
-			statusListener(status);
+		if (!terminalError) {
+			status = nextStatus;
+			emitStatus();
+		}
+	};
+
+	const assertUsable = (): void => {
+		if (terminalError) {
+			throw terminalError;
+		}
+	};
+
+	const runWhileUsable = async <Value>(operation: () => Promise<Value>): Promise<Value> => {
+		assertUsable();
+		try {
+			const value = await operation();
+			assertUsable();
+			return value;
+		} catch (error) {
+			if (terminalError) {
+				throw terminalError;
+			}
+			throw error;
 		}
 	};
 
@@ -197,7 +284,7 @@ export const createStandardPersister = async (
 	};
 
 	const scheduleRetry = (): void => {
-		if (isDestroyed) {
+		if (isDestroyed || terminalError) {
 			return;
 		}
 		const delay = Math.min(retryBaseDelayMs * 2 ** retryAttempt, retryMaxDelayMs);
@@ -206,6 +293,9 @@ export const createStandardPersister = async (
 	};
 
 	const reportSyncError = async (error: unknown): Promise<void> => {
+		if (terminalError) {
+			return;
+		}
 		const normalized = asError(error);
 		config.onError?.(normalized);
 		await setStatus('offline', normalized);
@@ -213,12 +303,15 @@ export const createStandardPersister = async (
 	};
 
 	const completeSync = async (): Promise<void> => {
+		if (terminalError) {
+			return;
+		}
 		clearRetry();
 		await setStatus('idle');
 	};
 
 	const reconcile = async (markIdle = true): Promise<boolean> => {
-		if (isDestroyed) {
+		if (isDestroyed || terminalError) {
 			return false;
 		}
 		await setStatus('syncing');
@@ -237,9 +330,12 @@ export const createStandardPersister = async (
 		}
 	};
 
-	const syncNow = (): Promise<void> => scheduler.runNow();
+	const syncNow = (): Promise<void> => runWhileUsable(() => scheduler.runNow());
 
 	const schedulePull = (tableId: string): void => {
+		if (terminalError) {
+			return;
+		}
 		const realtime = tableConfigs[tableId]?.realtime;
 		if (realtime) {
 			const delay = typeof realtime === 'object' ? (realtime.debounceMs ?? 200) : 200;
@@ -275,12 +371,38 @@ export const createStandardPersister = async (
 	};
 
 	const startSyncing = async (): Promise<void> => {
-		if (isDestroyed || hasStartedSyncing) {
+		await runWhileUsable(async () => {
+			if (isDestroyed || hasStartedSyncing) {
+				return;
+			}
+			hasStartedSyncing = true;
+			startRealtime();
+			await scheduler.start(config.pollIntervalMs ?? defaultPollIntervalMs);
+		});
+	};
+
+	const terminate = (error: IndexedDbConnectionClosedForUpgradeError): void => {
+		if (terminalError) {
 			return;
 		}
-		hasStartedSyncing = true;
-		startRealtime();
-		await scheduler.start(config.pollIntervalMs ?? defaultPollIntervalMs);
+		terminalError = error;
+		hasStartedSyncing = false;
+		clearRetry();
+		scheduler.stop();
+		const terminalChannels = channels.splice(0);
+		void Promise.all(terminalChannels.map((channel) => transport.unsubscribe(channel))).catch(
+			(cleanupError: unknown) => config.onError?.(asError(cleanupError)),
+		);
+		void stopAutoPersistence?.().catch((cleanupError: unknown) =>
+			config.onError?.(asError(cleanupError)),
+		);
+		status = {
+			...status,
+			lastError: error,
+			phase: 'error',
+		};
+		onTerminal?.(error);
+		emitStatus();
 	};
 
 	const basePersister = createCustomPersister(
@@ -291,7 +413,11 @@ export const createStandardPersister = async (
 			const operations = createOperations(content);
 			await persistContent(content, operations);
 			if (operations.length > 0) {
-				void syncNow();
+				void syncNow().catch((error: unknown) => {
+					if (error !== terminalError) {
+						config.onError?.(asError(error));
+					}
+				});
 			}
 		},
 		(nextListener) => {
@@ -305,7 +431,20 @@ export const createStandardPersister = async (
 	);
 
 	const baseDestroy = basePersister.destroy.bind(basePersister);
+	const baseLoad = basePersister.load.bind(basePersister);
+	const baseSave = basePersister.save.bind(basePersister);
+	const baseSchedule = basePersister.schedule.bind(basePersister);
+	const baseStartAutoLoad = basePersister.startAutoLoad.bind(basePersister);
 	const baseStartAutoPersisting = basePersister.startAutoPersisting.bind(basePersister);
+	const baseStartAutoSave = basePersister.startAutoSave.bind(basePersister);
+	const baseStopAutoPersisting = basePersister.stopAutoPersisting.bind(basePersister);
+	stopAutoPersistence = () => baseStopAutoPersisting(true);
+	const guardBaseMethod =
+		<Arguments extends unknown[], Value>(
+			method: (...arguments_: Arguments) => Promise<Value>,
+		): ((...arguments_: Arguments) => Promise<Value>) =>
+		(...arguments_) =>
+			runWhileUsable(() => method(...arguments_));
 	const baseMethods = Object.fromEntries(
 		Object.entries(basePersister).map(([name, method]) => [
 			name,
@@ -314,15 +453,18 @@ export const createStandardPersister = async (
 	);
 	let result: StandardPersister;
 	result = Object.assign(baseMethods as unknown as Persister, {
+		assertUsable,
 		addSyncStatusListener(nextListener: (nextStatus: SyncStatus) => void): () => void {
 			statusListeners.add(nextListener);
-			nextListener(status);
+			notifyStatusListener(nextListener);
 			return () => statusListeners.delete(nextListener);
 		},
 		completeSync,
 		async discardRejected(): Promise<void> {
-			await state.discardRejected();
-			await setStatus(status.phase, status.lastError);
+			await runWhileUsable(async () => {
+				await state.discardRejected();
+				await setStatus(status.phase, status.lastError);
+			});
 		},
 		async destroy(): Promise<StandardPersister> {
 			isDestroyed = true;
@@ -332,42 +474,69 @@ export const createStandardPersister = async (
 			return result;
 		},
 		async getRejectedOperations(): Promise<readonly RejectedOperation[]> {
-			return (await state.getRejected()).map(({ error, rowId, tableId }) => ({
-				error,
-				rowId,
-				tableId,
-			}));
+			return runWhileUsable(async () =>
+				(await state.getRejected()).map(({ error, rowId, tableId }) => ({
+					error,
+					rowId,
+					tableId,
+				})),
+			);
 		},
 		getSyncStatus(): SyncStatus {
 			return status;
 		},
 		async isRowBlocked(tableId: string, rowId: string): Promise<boolean> {
-			const id = operationId(tableId, rowId);
-			const [pending, rejected] = await Promise.all([
-				state.getOperations(),
-				state.getRejected(),
-			]);
-			return (
-				pending.some((operation) => operation.id === id) ||
-				rejected.some((row) => row.id === id)
-			);
+			return runWhileUsable(async () => {
+				const id = operationId(tableId, rowId);
+				const [pending, rejected] = await Promise.all([
+					state.getOperations(),
+					state.getRejected(),
+				]);
+				return (
+					pending.some((operation) => operation.id === id) ||
+					rejected.some((row) => row.id === id)
+				);
+			});
 		},
+		load: guardBaseMethod(baseLoad),
 		async retryRejected(): Promise<void> {
-			await state.retryRejected();
-			await syncNow();
+			await runWhileUsable(async () => {
+				await state.retryRejected();
+				await syncNow();
+			});
 		},
 		reconcile,
 		reportSyncError,
+		save: guardBaseMethod(baseSave),
+		schedule: guardBaseMethod(baseSchedule),
+		startAutoLoad: guardBaseMethod(baseStartAutoLoad),
+		startAutoSave: guardBaseMethod(baseStartAutoSave),
 		startSyncing,
 		async startAutoPersisting(): Promise<StandardPersister> {
-			await baseStartAutoPersisting();
-			await startSyncing();
-			return result;
+			try {
+				return await runWhileUsable(async () => {
+					await baseStartAutoPersisting();
+					assertUsable();
+					await startSyncing();
+					return result;
+				});
+			} catch (error) {
+				if (terminalError) {
+					await baseStopAutoPersisting(true);
+					throw terminalError;
+				}
+				throw error;
+			}
 		},
 		stopSyncing,
 		syncNow,
+		terminate,
 	}) as unknown as StandardPersister;
 
+	handleConnectionClosedForUpgrade = terminate;
+	if (pendingTerminalError) {
+		terminate(pendingTerminalError);
+	}
 	await setStatus('idle');
 	return result;
 };

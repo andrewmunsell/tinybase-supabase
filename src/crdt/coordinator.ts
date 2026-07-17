@@ -1,13 +1,17 @@
 import type { Row, Store } from 'tinybase';
 import * as Y from 'yjs';
 import { type BufferedCrdtUpdate, CrdtLocalState, type StoredCrdtUpdate } from '../crdt-storage.js';
+import {
+	type IndexedDbConnectionClosedForUpgradeError,
+	isIndexedDbConnectionClosedException,
+} from '../indexeddb-errors.js';
 import type { CrdtCellConfig, CrdtRowHandle, RejectedOperation } from '../types.js';
 import { getDocumentKey, getProjection, remoteOrigin } from './codec.js';
 import type { ConfiguredCrdtTable } from './config.js';
 import {
+	type CrdtRealtimeChannel,
 	CrdtTransport,
 	CrdtTransportError,
-	type CrdtRealtimeChannel,
 	type SupabaseError,
 } from './transport.js';
 
@@ -42,6 +46,7 @@ export interface CrdtCoordinator {
 	retryRejected(): Promise<void>;
 	startSyncing(): Promise<void>;
 	stopSyncing(): Promise<void>;
+	terminate(error: IndexedDbConnectionClosedForUpgradeError): void;
 }
 
 export const createCrdtCoordinator = async (
@@ -58,8 +63,24 @@ export const createCrdtCoordinator = async (
 	requestSync: () => Promise<void>,
 	scheduleSync: (delayMs: number) => void,
 	onStatusChange: () => void,
+	onTerminal: (error: IndexedDbConnectionClosedForUpgradeError) => void,
 ): Promise<CrdtCoordinator> => {
-	const state = await CrdtLocalState.open(config.databaseName, config.scopeKey);
+	let handleConnectionClosedForUpgrade:
+		| ((error: IndexedDbConnectionClosedForUpgradeError) => void)
+		| undefined;
+	let pendingTerminalError: IndexedDbConnectionClosedForUpgradeError | undefined;
+	const state = await CrdtLocalState.open(
+		config.databaseName,
+		config.scopeKey,
+		config.onError,
+		(error) => {
+			if (handleConnectionClosedForUpgrade) {
+				handleConnectionClosedForUpgrade(error);
+			} else {
+				pendingTerminalError = error;
+			}
+		},
+	);
 	const transport = new CrdtTransport(config.supabase, config.pageSize ?? 500, config.scopeKey);
 	const documents = new Map<string, OpenDocument>();
 	const openingDocuments = new Map<string, Promise<CrdtRowHandle>>();
@@ -70,21 +91,44 @@ export const createCrdtCoordinator = async (
 	let destroyed = false;
 	let started = false;
 	let syncGeneration = 0;
+	let terminalError: IndexedDbConnectionClosedForUpgradeError | undefined;
 	const readOnlyTableIds = new Set(
 		Object.entries(tables)
 			.filter(([, table]) => table.mode === 'read-only')
 			.map(([tableId]) => tableId),
 	);
-	await state.discardTableLocalState(readOnlyTableIds);
+	const readDuringInitialization = async <Value>(
+		read: () => Promise<Value>,
+		fallback: Value,
+	): Promise<Value> => {
+		try {
+			const value = await read();
+			return pendingTerminalError ? fallback : value;
+		} catch (error) {
+			if (pendingTerminalError && isIndexedDbConnectionClosedException(error)) {
+				return fallback;
+			}
+			throw error;
+		}
+	};
+	await readDuringInitialization(() => state.discardTableLocalState(readOnlyTableIds), {
+		pendingCount: 0,
+		rejectedCount: 0,
+	});
 	const [initialOutbox, initialBuffer, initialRejected] = await Promise.all([
-		state.getOutbox(),
-		state.getBuffered(),
-		state.getRejected(),
+		readDuringInitialization(() => state.getOutbox(), []),
+		readDuringInitialization(() => state.getBuffered(), []),
+		readDuringInitialization(() => state.getRejected(), []),
 	]);
 	let pendingCount = initialOutbox.length + initialBuffer.length;
 	let rejectedCount = initialRejected.length;
 	const reportError = (error: unknown): void =>
 		config.onError?.(error instanceof Error ? error : new Error(String(error)));
+	const assertUsable = (): void => {
+		if (terminalError) {
+			throw terminalError;
+		}
+	};
 	const waitForPendingWrites = async (): Promise<void> => {
 		await Promise.all(
 			[...documents.values()].flatMap(({ pendingWrites }) => [...pendingWrites]),
@@ -92,7 +136,7 @@ export const createCrdtCoordinator = async (
 	};
 
 	const scheduleBufferedUpdates = async (): Promise<void> => {
-		if (!started) {
+		if (!started || terminalError) {
 			return;
 		}
 		const buffered = await state.getBuffered();
@@ -207,6 +251,7 @@ export const createCrdtCoordinator = async (
 	};
 
 	const pull = async (open: OpenDocument): Promise<void> => {
+		assertUsable();
 		const table = tables[open.tableId];
 		if (!table) {
 			return;
@@ -222,6 +267,7 @@ export const createCrdtCoordinator = async (
 	};
 
 	const subscribeInternal = async (open: OpenDocument): Promise<OpenDocument> => {
+		assertUsable();
 		const table = tables[open.tableId];
 		if (!started || !table?.realtime || open.channel) {
 			return open;
@@ -238,7 +284,11 @@ export const createCrdtCoordinator = async (
 				open.tableId,
 				open.rowId,
 				table,
-				() => scheduleSync(delay),
+				() => {
+					if (!terminalError) {
+						scheduleSync(delay);
+					}
+				},
 				controller.signal,
 			);
 		} catch (error) {
@@ -345,6 +395,7 @@ export const createCrdtCoordinator = async (
 		const pendingWrites = new Set<Promise<void>>();
 		const lifecycle = { active: true };
 		const assertWritable = (): void => {
+			assertUsable();
 			if (!lifecycle.active) {
 				throw new Error(`CRDT row ${tableId}.${rowId} is closed`);
 			}
@@ -366,28 +417,291 @@ export const createCrdtCoordinator = async (
 			'setAttribute',
 			'unshift',
 		]);
+		const callbackMethods = new Set<PropertyKey>(['forEach', 'map']);
+		const observerMethods = new Set<PropertyKey>(['observe', 'observeDeep']);
+		const unobserverMethods = new Set<PropertyKey>(['unobserve', 'unobserveDeep']);
 		const guardedTypes = new WeakMap<object, object>();
+		const guardedProxies = new WeakSet<object>();
+		const guardedDocuments = new WeakMap<Y.Doc, Y.Doc>();
+		const guardedDocumentProxies = new WeakSet<Y.Doc>();
+		const guardedEvents = new WeakMap<object, object>();
+		const guardedTransactions = new WeakMap<Y.Transaction, object>();
+		const instrumentedTypes = new WeakSet<object>();
+		const instrumentedValues = new WeakSet<object>();
+		const observerCallbacks = new WeakMap<
+			object,
+			Map<PropertyKey, WeakMap<object, (...args: unknown[]) => unknown>>
+		>();
+		const instrumentDocument = (value: Y.Doc): Y.Doc => {
+			if (guardedDocumentProxies.has(value)) {
+				return value;
+			}
+			const existing = guardedDocuments.get(value);
+			if (existing) {
+				return existing;
+			}
+			let transaction: unknown = Reflect.get(value, '_transaction', value);
+			Object.defineProperty(value, '_transaction', {
+				configurable: true,
+				get: () => transaction,
+				set: (nextTransaction: unknown) => {
+					if (nextTransaction !== null) {
+						assertUsable();
+						if (
+							!(nextTransaction instanceof Y.Transaction) ||
+							nextTransaction.origin !== remoteOrigin
+						) {
+							assertWritable();
+						}
+					}
+					transaction = nextTransaction;
+				},
+			});
+			const guarded = new Proxy(value, {
+				get(target, property) {
+					const item: unknown = Reflect.get(target, property, target);
+					if (property === 'transact' && typeof item === 'function') {
+						return (...args: unknown[]) => {
+							assertWritable();
+							return guardReturnedValue(Reflect.apply(item, target, args));
+						};
+					}
+					return typeof item === 'function'
+						? (...args: unknown[]) =>
+								guardReturnedValue(Reflect.apply(item, target, args))
+						: item;
+				},
+				set(target, property, nextValue) {
+					if (property === '_transaction' && nextValue !== null) {
+						assertWritable();
+					}
+					return Reflect.set(target, property, nextValue, target);
+				},
+			});
+			guardedDocuments.set(value, guarded);
+			guardedDocumentProxies.add(guarded);
+			return guarded;
+		};
+		const instrumentValue = (value: unknown): void => {
+			if (typeof value !== 'object' || value === null || guardedProxies.has(value)) {
+				return;
+			}
+			if (value instanceof Y.AbstractType) {
+				guardMutations(value);
+				return;
+			}
+			if (value instanceof Y.Doc) {
+				instrumentDocument(value);
+				return;
+			}
+			if (instrumentedValues.has(value)) {
+				return;
+			}
+			instrumentedValues.add(value);
+			if (value instanceof Y.YEvent) {
+				instrumentValue(value.target);
+				instrumentValue(value.currentTarget);
+				instrumentValue(value.transaction);
+				return;
+			}
+			if (value instanceof Y.Transaction) {
+				instrumentDocument(value.doc);
+				for (const type of value.changed.keys()) {
+					instrumentValue(type);
+				}
+				for (const [type, events] of value.changedParentTypes) {
+					instrumentValue(type);
+					instrumentValue(events);
+				}
+				return;
+			}
+			if (Array.isArray(value)) {
+				for (const item of value) {
+					instrumentValue(item);
+				}
+				return;
+			}
+			for (const item of Object.values(value)) {
+				instrumentValue(item);
+			}
+		};
+		const guardReturnedValue = (value: unknown): unknown => {
+			instrumentValue(value);
+			if (value instanceof Y.AbstractType) {
+				return guardMutations(value);
+			}
+			if (value instanceof Y.Doc) {
+				return instrumentDocument(value);
+			}
+			if (value instanceof Y.YEvent) {
+				const existing = guardedEvents.get(value);
+				if (existing) {
+					return existing;
+				}
+				const guarded = new Proxy(value, {
+					get(target, property) {
+						const item: unknown = Reflect.get(target, property, target);
+						return typeof item === 'function'
+							? (...args: unknown[]) =>
+									guardReturnedValue(Reflect.apply(item, target, args))
+							: guardReturnedValue(item);
+					},
+				});
+				guardedEvents.set(value, guarded);
+				return guarded;
+			}
+			if (value instanceof Y.Transaction) {
+				const existing = guardedTransactions.get(value);
+				if (existing) {
+					return existing;
+				}
+				const guarded = new Proxy(value, {
+					get(target, property) {
+						return guardReturnedValue(Reflect.get(target, property, target));
+					},
+				});
+				guardedTransactions.set(value, guarded);
+				return guarded;
+			}
+			if (Array.isArray(value)) {
+				return value.map(guardReturnedValue);
+			}
+			if (
+				typeof value === 'object' &&
+				value !== null &&
+				typeof (value as Partial<Iterator<unknown>>).next === 'function' &&
+				typeof (value as { [Symbol.iterator]?: unknown })[Symbol.iterator] === 'function'
+			) {
+				const iterator = value as Iterator<unknown>;
+				const guardedIterator: IterableIterator<unknown> = {
+					next() {
+						const result = iterator.next();
+						return result.done
+							? result
+							: { done: false, value: guardReturnedValue(result.value) };
+					},
+					[Symbol.iterator]() {
+						return guardedIterator;
+					},
+				};
+				return guardedIterator;
+			}
+			return value;
+		};
 		const guardMutations = <SharedType extends object>(sharedType: SharedType): SharedType => {
+			if (guardedProxies.has(sharedType)) {
+				return sharedType;
+			}
 			const existing = guardedTypes.get(sharedType);
 			if (existing) {
 				return existing as SharedType;
+			}
+			if (sharedType instanceof Y.AbstractType && !instrumentedTypes.has(sharedType)) {
+				instrumentedTypes.add(sharedType);
+				if (sharedType.doc) {
+					instrumentDocument(sharedType.doc);
+				}
+				for (const property of mutatingMethods) {
+					const method: unknown = Reflect.get(sharedType, property, sharedType);
+					if (typeof method !== 'function') {
+						continue;
+					}
+					Object.defineProperty(sharedType, property, {
+						configurable: true,
+						value: (...args: unknown[]) => {
+							assertWritable();
+							for (const argument of args) {
+								instrumentValue(argument);
+							}
+							return Reflect.apply(method, sharedType, args);
+						},
+					});
+				}
+				if (sharedType.doc) {
+					const descendants: unknown[] = [];
+					if (sharedType instanceof Y.Map) {
+						descendants.push(...sharedType.values());
+					}
+					if (sharedType instanceof Y.Array || sharedType instanceof Y.XmlFragment) {
+						descendants.push(...sharedType.toArray());
+					}
+					if (sharedType instanceof Y.Text) {
+						for (const operation of sharedType.toDelta()) {
+							descendants.push(operation.insert);
+						}
+					}
+					for (const descendant of descendants) {
+						instrumentValue(descendant);
+					}
+				}
 			}
 			const guarded = new Proxy(sharedType, {
 				get(target, property) {
 					const value: unknown = Reflect.get(target, property, target);
 					if (typeof value !== 'function' || property === 'constructor') {
-						return value;
+						return guardReturnedValue(value);
 					}
 					if (mutatingMethods.has(property)) {
 						return (...args: unknown[]) => {
 							assertWritable();
-							return Reflect.apply(value, target, args);
+							return guardReturnedValue(Reflect.apply(value, target, args));
 						};
 					}
-					return value.bind(target);
+					return (...args: unknown[]) => {
+						if (observerMethods.has(property) && typeof args[0] === 'function') {
+							const callback = args[0];
+							let byMode = observerCallbacks.get(target);
+							if (!byMode) {
+								byMode = new Map();
+								observerCallbacks.set(target, byMode);
+							}
+							let byCallback = byMode.get(property);
+							if (!byCallback) {
+								byCallback = new WeakMap();
+								byMode.set(property, byCallback);
+							}
+							let guardedCallback = byCallback.get(callback);
+							if (!guardedCallback) {
+								guardedCallback = function (
+									this: unknown,
+									...callbackArguments: unknown[]
+								) {
+									return Reflect.apply(
+										callback,
+										this,
+										callbackArguments.map(guardReturnedValue),
+									);
+								};
+								byCallback.set(callback, guardedCallback);
+							}
+							args[0] = guardedCallback;
+						} else if (
+							unobserverMethods.has(property) &&
+							typeof args[0] === 'function'
+						) {
+							const observerProperty =
+								property === 'unobserve' ? 'observe' : 'observeDeep';
+							args[0] =
+								observerCallbacks
+									.get(target)
+									?.get(observerProperty)
+									?.get(args[0]) ?? args[0];
+						} else if (callbackMethods.has(property) && typeof args[0] === 'function') {
+							const callback = args[0];
+							args[0] = function (this: unknown, ...callbackArguments: unknown[]) {
+								return Reflect.apply(
+									callback,
+									this,
+									callbackArguments.map(guardReturnedValue),
+								);
+							};
+						}
+						return guardReturnedValue(Reflect.apply(value, target, args));
+					};
 				},
 			});
 			guardedTypes.set(sharedType, guarded);
+			guardedProxies.add(guarded);
 			return guarded;
 		};
 		const assertType = (cellId: string, expected: CrdtCellConfig['type']): void => {
@@ -424,6 +738,10 @@ export const createCrdtCoordinator = async (
 		documents.set(key, open);
 		document.on('update', (bytes: Uint8Array, origin: unknown) => {
 			if (origin === remoteOrigin) {
+				return;
+			}
+			if (terminalError) {
+				reportError(terminalError);
 				return;
 			}
 			if (!lifecycle.active || table.mode === 'read-only') {
@@ -505,6 +823,9 @@ export const createCrdtCoordinator = async (
 	};
 
 	const openRow = (tableId: string, rowId: string): Promise<CrdtRowHandle> => {
+		if (terminalError) {
+			return Promise.reject(terminalError);
+		}
 		if (destroyed) {
 			return Promise.reject(new Error('CRDT coordinator has been destroyed'));
 		}
@@ -525,6 +846,57 @@ export const createCrdtCoordinator = async (
 		return promise;
 	};
 
+	const startSyncing = async (): Promise<void> => {
+		assertUsable();
+		if (started) {
+			return;
+		}
+		started = true;
+		syncGeneration += 1;
+		for (const open of [...documents.values()]) {
+			try {
+				await subscribe(open);
+			} catch (error) {
+				if (terminalError) {
+					throw terminalError;
+				}
+				reportError(error);
+			}
+		}
+		await scheduleBufferedUpdates();
+		assertUsable();
+	};
+
+	const stopSyncing = async (): Promise<void> => {
+		started = false;
+		syncGeneration += 1;
+		for (const controller of pendingSubscriptions.values()) {
+			controller.abort();
+		}
+		for (const [key, open] of documents) {
+			if (!open.channel) {
+				continue;
+			}
+			await transport.unsubscribe(open.channel);
+			const { channel: _channel, ...closed } = open;
+			documents.set(key, closed);
+		}
+	};
+
+	const terminate = (error: IndexedDbConnectionClosedForUpgradeError): void => {
+		if (terminalError) {
+			return;
+		}
+		terminalError = error;
+		void stopSyncing().catch(reportError);
+		onTerminal(error);
+	};
+
+	handleConnectionClosedForUpgrade = terminate;
+	if (pendingTerminalError) {
+		terminate(pendingTerminalError);
+	}
+
 	return {
 		closeRow,
 		async destroy() {
@@ -543,6 +915,7 @@ export const createCrdtCoordinator = async (
 			state.close();
 		},
 		async discardRejected() {
+			assertUsable();
 			const quarantined = await state.getQuarantined();
 			for (const { documentKey } of quarantined) {
 				const open = documents.get(documentKey);
@@ -561,6 +934,7 @@ export const createCrdtCoordinator = async (
 			onStatusChange();
 		},
 		async flushOutbox(isRowBlocked) {
+			assertUsable();
 			await compactBufferedUpdates(false);
 			const quarantined = new Map(
 				(await state.getQuarantined()).map((document) => [document.documentKey, document]),
@@ -606,8 +980,10 @@ export const createCrdtCoordinator = async (
 			}
 		},
 		async flushBufferedUpdates() {
+			assertUsable();
 			await waitForPendingWrites();
 			await compactBufferedUpdates(true);
+			assertUsable();
 		},
 		getPendingCount: () => pendingCount,
 		getProjection(tableId, rowId) {
@@ -615,6 +991,7 @@ export const createCrdtCoordinator = async (
 			return open ? getOpenProjection(open) : undefined;
 		},
 		async getRejected() {
+			assertUsable();
 			return (await state.getRejected()).map(({ error, rowId, tableId }) => ({
 				error,
 				rowId,
@@ -625,45 +1002,20 @@ export const createCrdtCoordinator = async (
 		isRowOpen: (tableId, rowId) => documents.has(getDocumentKey(tableId, rowId)),
 		openRow,
 		async pullOpenDocuments() {
+			assertUsable();
 			for (const open of [...documents.values()]) {
 				await pull(await subscribe(open));
 			}
 		},
 		async retryRejected() {
+			assertUsable();
 			const retriedCount = await state.retryRejected();
 			pendingCount += retriedCount;
 			rejectedCount -= retriedCount;
 			onStatusChange();
 		},
-		async startSyncing() {
-			if (started) {
-				return;
-			}
-			started = true;
-			syncGeneration += 1;
-			for (const open of [...documents.values()]) {
-				try {
-					await subscribe(open);
-				} catch (error) {
-					reportError(error);
-				}
-			}
-			await scheduleBufferedUpdates();
-		},
-		async stopSyncing() {
-			started = false;
-			syncGeneration += 1;
-			for (const controller of pendingSubscriptions.values()) {
-				controller.abort();
-			}
-			for (const [key, open] of documents) {
-				if (!open.channel) {
-					continue;
-				}
-				await transport.unsubscribe(open.channel);
-				const { channel: _channel, ...closed } = open;
-				documents.set(key, closed);
-			}
-		},
+		startSyncing,
+		stopSyncing,
+		terminate,
 	};
 };

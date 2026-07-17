@@ -37,6 +37,7 @@ export const createShadowStoreBridge = (
 	const shadowListenerIds: string[] = [];
 	let applyingProjection = false;
 	let applyingShadow = false;
+	let destroyed = false;
 
 	for (const [tableId, tableConfig] of Object.entries(config.tables)) {
 		storeListenerIds.push(
@@ -114,6 +115,10 @@ export const createShadowStoreBridge = (
 
 	return {
 		destroy() {
+			if (destroyed) {
+				return;
+			}
+			destroyed = true;
 			for (const listenerId of storeListenerIds) {
 				store.delListener(listenerId);
 			}

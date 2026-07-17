@@ -1,8 +1,13 @@
 import 'fake-indexeddb/auto';
+import { jest } from '@jest/globals';
+import { openDB } from 'idb';
 import { createStore } from 'tinybase';
 import * as Y from 'yjs';
 import { CrdtLocalState } from '../../src/crdt-storage.js';
-import { createSupabasePersister } from '../../src/index.js';
+import {
+	createSupabasePersister,
+	IndexedDbConnectionClosedForUpgradeError,
+} from '../../src/index.js';
 
 type RemoteRow = Record<string, unknown>;
 type RemoteError = { message: string; status: number };
@@ -237,6 +242,222 @@ const configuration = (client: MemorySupabase, databaseName: string) => ({
 });
 
 describe('createSupabasePersister with CRDT cells', () => {
+	it('normalizes a CRDT upgrade that closes IndexedDB during initialization', async () => {
+		const client = new MemorySupabase();
+		const databaseName = `initialization-crdt-upgrade-${crypto.randomUUID()}`;
+		const store = createStore().setRow('documents', 'doc-1', { owner_id: 'user' });
+		let releaseRead = (): void => undefined;
+		let reportReadStarted = (): void => undefined;
+		const readStarted = new Promise<void>((resolve) => {
+			reportReadStarted = resolve;
+		});
+		const readGate = new Promise<void>((resolve) => {
+			releaseRead = resolve;
+		});
+		const originalDiscard = CrdtLocalState.prototype.discardTableLocalState;
+		const discard = jest
+			.spyOn(CrdtLocalState.prototype, 'discardTableLocalState')
+			.mockImplementation(async function (
+				this: CrdtLocalState,
+				tableIds: ReadonlySet<string>,
+			) {
+				reportReadStarted();
+				await readGate;
+				return originalDiscard.call(this, tableIds);
+			});
+		let futureDatabase: Awaited<ReturnType<typeof openDB>> | undefined;
+		try {
+			const creation = createSupabasePersister(store, configuration(client, databaseName));
+			await readStarted;
+			futureDatabase = await openDB(`${databaseName}:user:yjs`, 4);
+			releaseRead();
+			const persister = await creation;
+			const terminalStatus = persister.getSyncStatus();
+			const terminalError = terminalStatus.lastError;
+
+			expect(terminalStatus.phase).toBe('error');
+			expect(terminalError).toMatchObject({
+				code: 'indexeddb-connection-closed-for-upgrade',
+				currentVersion: 3,
+				requestedVersion: 4,
+			});
+			await expect(persister.openRow('documents', 'doc-1')).rejects.toBe(terminalError);
+			await persister.destroy();
+		} finally {
+			releaseRead();
+			futureDatabase?.close();
+			discard.mockRestore();
+		}
+	});
+
+	it('preserves an unrelated CRDT initialization error that races with an upgrade', async () => {
+		const client = new MemorySupabase();
+		const databaseName = `initialization-crdt-error-${crypto.randomUUID()}`;
+		const sentinel = new Error('Unrelated CRDT initialization failure');
+		const store = createStore().setRow('documents', 'doc-1', { owner_id: 'user' });
+		let releaseRead = (): void => undefined;
+		let reportReadStarted = (): void => undefined;
+		const readStarted = new Promise<void>((resolve) => {
+			reportReadStarted = resolve;
+		});
+		const readGate = new Promise<void>((resolve) => {
+			releaseRead = resolve;
+		});
+		const discard = jest
+			.spyOn(CrdtLocalState.prototype, 'discardTableLocalState')
+			.mockImplementation(async () => {
+				reportReadStarted();
+				await readGate;
+				throw sentinel;
+			});
+		let futureDatabase: Awaited<ReturnType<typeof openDB>> | undefined;
+		try {
+			const creation = createSupabasePersister(store, configuration(client, databaseName));
+			await readStarted;
+			futureDatabase = await openDB(`${databaseName}:user:yjs`, 4);
+			releaseRead();
+			await expect(creation).rejects.toBe(sentinel);
+		} finally {
+			releaseRead();
+			futureDatabase?.close();
+			discard.mockRestore();
+		}
+	});
+
+	it('finishes hybrid termination when a status listener throws', async () => {
+		const client = new MemorySupabase();
+		client.rows.set('documents', [{ id: 'doc-1', owner_id: 'user' }]);
+		const databaseName = `terminal-crdt-upgrade-${crypto.randomUUID()}`;
+		const store = createStore().setRow('documents', 'doc-1', { owner_id: 'user' });
+		const persister = await createSupabasePersister(store, {
+			...configuration(client, databaseName),
+			tables: {
+				documents: {
+					...configuration(client, databaseName).tables.documents,
+					crdtCells: {
+						...configuration(client, databaseName).tables.documents.crdtCells,
+						structuredBody: { type: 'xml-fragment' },
+					},
+					realtime: true,
+				},
+			},
+		});
+		await persister.startAutoPersisting();
+		const row = await persister.openRow('documents', 'doc-1');
+		const nestedMap = new Y.Map<string>();
+		row.getMap<unknown>('properties').set('child', nestedMap);
+		const guardedNestedMap = row.getMap<unknown>('properties').get('child') as Y.Map<string>;
+		const retainedDocument = nestedMap.doc;
+		const documentText = row.getText('body').doc?.getText('body');
+		const guardedDocument = documentText?.doc;
+		const retainedXmlText = new Y.XmlText();
+		retainedXmlText.insert(0, 'Before termination');
+		const retainedXmlElement = new Y.XmlElement('paragraph');
+		retainedXmlElement.insert(0, [retainedXmlText]);
+		row.getXmlFragment('structuredBody').insert(0, [retainedXmlElement]);
+		const remoteDocument = new Y.Doc();
+		remoteDocument.getText('body').insert(0, 'Remote update');
+		const remoteUpdate = Y.encodeStateAsUpdate(remoteDocument);
+		remoteDocument.destroy();
+		expect(client.channels.length).toBeGreaterThan(0);
+		persister.addSyncStatusListener((status) => {
+			if (status.phase === 'error') {
+				throw new Error('Status listener failed');
+			}
+		});
+		const statuses: Array<ReturnType<typeof persister.getSyncStatus>> = [];
+		persister.addSyncStatusListener((status) => statuses.push(status));
+
+		const futureDatabase = await openDB(`${databaseName}:user`, 3);
+		const terminalStatus = persister.getSyncStatus();
+		const terminalError = terminalStatus.lastError;
+
+		expect(terminalStatus.phase).toBe('error');
+		expect(terminalError).toBeInstanceOf(IndexedDbConnectionClosedForUpgradeError);
+		expect(terminalError).toMatchObject({
+			code: 'indexeddb-connection-closed-for-upgrade',
+			currentVersion: 2,
+			requestedVersion: 3,
+		});
+		expect(statuses.at(-1)?.lastError).toBe(terminalError);
+		expect(statuses.at(-1)?.phase).toBe('error');
+		expect(persister.isAutoSaving()).toBe(false);
+		await waitFor(
+			() => client.channels.every(({ active }) => !active),
+			'Realtime channels remained active after IndexedDB closed',
+		);
+
+		let mutationError: unknown;
+		try {
+			row.getText('body').insert(0, 'Must not persist');
+		} catch (error) {
+			mutationError = error;
+		}
+		expect(mutationError).toBe(terminalError);
+		let nestedMutationError: unknown;
+		try {
+			guardedNestedMap.set('after', 'termination');
+		} catch (error) {
+			nestedMutationError = error;
+		}
+		expect(nestedMutationError).toBe(terminalError);
+		let retainedMutationError: unknown;
+		try {
+			nestedMap.set('retained', 'after termination');
+		} catch (error) {
+			retainedMutationError = error;
+		}
+		expect(retainedMutationError).toBe(terminalError);
+		let documentMutationError: unknown;
+		try {
+			documentText?.insert(0, 'Must not persist');
+		} catch (error) {
+			documentMutationError = error;
+		}
+		expect(documentMutationError).toBe(terminalError);
+		let applyUpdateError: unknown;
+		try {
+			if (guardedDocument) {
+				Y.applyUpdate(guardedDocument, remoteUpdate);
+			}
+		} catch (error) {
+			applyUpdateError = error;
+		}
+		expect(applyUpdateError).toBe(terminalError);
+		let retainedDocumentError: unknown;
+		try {
+			if (retainedDocument) {
+				Y.applyUpdate(retainedDocument, remoteUpdate);
+			}
+		} catch (error) {
+			retainedDocumentError = error;
+		}
+		expect(retainedDocumentError).toBe(terminalError);
+		let retainedDescendantError: unknown;
+		try {
+			retainedXmlText.insert(0, 'Must not persist');
+		} catch (error) {
+			retainedDescendantError = error;
+		}
+		expect(retainedDescendantError).toBe(terminalError);
+		for (const operation of [
+			persister.load(),
+			persister.save(),
+			persister.syncNow(),
+			persister.startSyncing(),
+			persister.startAutoPersisting(),
+			persister.openRow('documents', 'doc-1'),
+			persister.retryRejected(),
+			persister.discardRejected(),
+			persister.getRejectedOperations(),
+		]) {
+			await expect(operation).rejects.toBe(terminalError);
+		}
+
+		futureDatabase.close();
+		await persister.destroy();
+	});
+
 	it('uses the ordinary implementation when crdtCells is empty and needs no updates table', async () => {
 		const client = new MemorySupabase();
 		const store = createStore();
@@ -321,6 +542,7 @@ describe('createSupabasePersister with CRDT cells', () => {
 		await reader.startSyncing();
 		const readerRow = await reader.openRow('documents', 'doc-1');
 		expect(readerStore.getCell('documents', 'doc-1', 'body')).toBe('Remote');
+		expect(readerRow.getText('body').doc).toBeDefined();
 
 		writerRow.getText('body').insert(6, ' update');
 		await tick();
@@ -354,6 +576,42 @@ describe('createSupabasePersister with CRDT cells', () => {
 		expect(readerStore.getCell('documents', 'doc-1', 'body')).toBe('Remote update');
 		await reader.destroy();
 		await writer.destroy();
+	});
+
+	it('preserves Yjs observer identity across targets and observer modes', async () => {
+		const client = new MemorySupabase();
+		client.rows.set('documents', [{ id: 'doc-1', owner_id: 'owner' }]);
+		const store = createStore().setRow('documents', 'doc-1', { owner_id: 'owner' });
+		const persister = await createSupabasePersister(
+			store,
+			configuration(client, `observer-identity-${crypto.randomUUID()}`),
+		);
+		const row = await persister.openRow('documents', 'doc-1');
+		const body = row.getText('body');
+		const properties = row.getMap('properties');
+		const observer = jest.fn();
+
+		body.observe(observer);
+		body.observe(observer);
+		body.observeDeep(observer);
+		properties.observe(observer);
+		body.insert(0, 'first');
+		expect(observer).toHaveBeenCalledTimes(3);
+
+		body.unobserve(observer);
+		body.insert(5, ' second');
+		expect(observer).toHaveBeenCalledTimes(4);
+		body.unobserveDeep(observer);
+		body.insert(12, ' third');
+		expect(observer).toHaveBeenCalledTimes(4);
+
+		properties.set('observed', true);
+		expect(observer).toHaveBeenCalledTimes(5);
+		properties.unobserve(observer);
+		properties.set('unobserved', true);
+		expect(observer).toHaveBeenCalledTimes(5);
+
+		await persister.destroy();
 	});
 
 	it('discards buffered CRDT writes when a table is reopened read-only', async () => {

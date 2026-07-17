@@ -1,5 +1,9 @@
-import { openDB, type DBSchema, type IDBPDatabase } from 'idb';
+import { type DBSchema, type IDBPDatabase, openDB } from 'idb';
 import type { Content } from 'tinybase';
+import {
+	getIndexedDbLifecycleCallbacks,
+	type IndexedDbConnectionClosedForUpgradeError,
+} from './indexeddb-errors.js';
 
 export interface PendingOperation {
 	readonly id: string;
@@ -49,31 +53,27 @@ export class LocalState {
 	static async open(
 		databaseName: string,
 		scopeKey: string,
-		onBlocked?: (error: Error) => void,
+		onError?: (error: Error) => void,
+		onConnectionClosedForUpgrade?: (error: IndexedDbConnectionClosedForUpgradeError) => void,
 	): Promise<LocalState> {
-		const database = await openDB<PersisterDatabase>(
-			`${databaseName}:${scopeKey}`,
-			databaseVersion,
-			{
-				blocked() {
-					onBlocked?.(
-						new Error(
-							`IndexedDB upgrade blocked for ${databaseName}:${scopeKey}; reload other tabs using this scope`,
-						),
-					);
-				},
-				upgrade(upgradeDatabase, oldVersion) {
-					if (oldVersion < 1) {
-						upgradeDatabase.createObjectStore('content');
-						upgradeDatabase.createObjectStore('outbox');
-						upgradeDatabase.createObjectStore('rejected');
-					}
-					if (oldVersion < 2) {
-						upgradeDatabase.createObjectStore('cursors');
-					}
-				},
+		const scopedDatabaseName = `${databaseName}:${scopeKey}`;
+		const database = await openDB<PersisterDatabase>(scopedDatabaseName, databaseVersion, {
+			...getIndexedDbLifecycleCallbacks<PersisterDatabase>(
+				scopedDatabaseName,
+				onError,
+				onConnectionClosedForUpgrade,
+			),
+			upgrade(upgradeDatabase, oldVersion) {
+				if (oldVersion < 1) {
+					upgradeDatabase.createObjectStore('content');
+					upgradeDatabase.createObjectStore('outbox');
+					upgradeDatabase.createObjectStore('rejected');
+				}
+				if (oldVersion < 2) {
+					upgradeDatabase.createObjectStore('cursors');
+				}
 			},
-		);
+		});
 
 		return new LocalState(database);
 	}

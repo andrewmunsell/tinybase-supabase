@@ -1,4 +1,9 @@
-import { openDB, type DBSchema, type IDBPDatabase } from 'idb';
+import { type DBSchema, type IDBPDatabase, openDB } from 'idb';
+import {
+	getIndexedDbLifecycleCallbacks,
+	type IndexedDbConnectionClosedForUpgradeError,
+	isIndexedDbConnectionClosedException,
+} from './indexeddb-errors.js';
 
 export interface StoredCrdtUpdate {
 	readonly documentKey: string;
@@ -60,8 +65,23 @@ export class CrdtLocalState {
 		this.#database = database;
 	}
 
-	static async open(databaseName: string, scopeKey: string): Promise<CrdtLocalState> {
-		const database = await openDB<CrdtDatabase>(`${databaseName}:${scopeKey}:yjs`, 3, {
+	static async open(
+		databaseName: string,
+		scopeKey: string,
+		onError?: (error: Error) => void,
+		onConnectionClosedForUpgrade?: (error: IndexedDbConnectionClosedForUpgradeError) => void,
+	): Promise<CrdtLocalState> {
+		const scopedDatabaseName = `${databaseName}:${scopeKey}:yjs`;
+		let connectionClosedError: IndexedDbConnectionClosedForUpgradeError | undefined;
+		const database = await openDB<CrdtDatabase>(scopedDatabaseName, 3, {
+			...getIndexedDbLifecycleCallbacks<CrdtDatabase>(
+				scopedDatabaseName,
+				onError,
+				(error) => {
+					connectionClosedError = error;
+					onConnectionClosedForUpgrade?.(error);
+				},
+			),
 			upgrade(upgradeDatabase, oldVersion, _newVersion, upgradeTransaction) {
 				if (oldVersion < 1) {
 					const updates = upgradeDatabase.createObjectStore('updates');
@@ -85,7 +105,13 @@ export class CrdtLocalState {
 			},
 		});
 		const state = new CrdtLocalState(database);
-		await state.#backfillQuarantinedDocuments();
+		try {
+			await state.#backfillQuarantinedDocuments();
+		} catch (error) {
+			if (!connectionClosedError || !isIndexedDbConnectionClosedException(error)) {
+				throw error;
+			}
+		}
 		return state;
 	}
 
