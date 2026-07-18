@@ -1,5 +1,11 @@
 # tinybase-supabase
 
+## 0.3.1
+
+### Patch Changes
+
+- 7e32c2e: Report blocked IndexedDB upgrades with typed errors, resume automatically after stale tabs close, and make persisters terminal after cooperatively closing current connections for future schema upgrades.
+
 ## 0.3.0
 
 ### Minor Changes
