@@ -1,5 +1,5 @@
-import type { Persister } from 'tinybase/persisters';
 import type { Row } from 'tinybase';
+import type { Persister } from 'tinybase/persisters';
 import type * as Y from 'yjs';
 
 export type SupabaseRow = Record<string, unknown>;
@@ -70,7 +70,7 @@ export interface SupabasePersisterConfig {
 	readonly retryBaseDelayMs?: number;
 	/** Maximum retry delay after repeated transient failures. Defaults to 30 seconds. */
 	readonly retryMaxDelayMs?: number;
-	/** Called for ignored persistence, realtime, and synchronization errors. */
+	/** Supplemental notification for IndexedDB lifecycle, persistence, Realtime, and sync errors. */
 	readonly onError?: (error: Error) => void;
 }
 

@@ -84,7 +84,7 @@ options:
 | `crdtUpdateBufferMs` | `number` | `500` | Time to buffer and merge local Yjs updates per row before upload. Set to `0` for immediate upload; local durability is not delayed. |
 | `retryBaseDelayMs` | `number` | `1000` | Initial delay for exponential retry after a transient synchronization failure. |
 | `retryMaxDelayMs` | `number` | `30000` | Maximum delay between retries after repeated transient failures. |
-| `onError` | `(error: Error) => void` | None | Receives persistence, Realtime, and synchronization errors. |
+| `onError` | `(error: Error) => void` | None | Receives IndexedDB lifecycle, persistence, Realtime, and synchronization errors. |
 
 Each entry in `tables` supports these options:
 
@@ -230,6 +230,42 @@ and merged per row before upload. Set `crdtUpdateBufferMs` to tune the
 collaboration-latency/row-count tradeoff, or call `syncNow()` to flush the
 current buffer immediately.
 
+### IndexedDB upgrades
+
+An IndexedDB schema upgrade can be blocked while an older application tab keeps
+the same scoped database open. In that case, `onError` promptly receives an
+`IndexedDbUpgradeBlockedError` with `code: 'indexeddb-upgrade-blocked'`. The
+`createSupabasePersister` promise remains pending and completes automatically
+after the older connection closes. Tell users to close other tabs;
+initialization will resume automatically. The library does not delete or reset
+local content, queued writes, or rejected writes.
+
+Connections opened by this version listen for future schema upgrades and close
+cooperatively. The affected consumer receives an
+`IndexedDbConnectionClosedForUpgradeError` with
+`code: 'indexeddb-connection-closed-for-upgrade'`. The persister enters the
+terminal `error` phase, stops automatic persistence and background sync, and
+rejects later persistence and sync operations with that same error. Consumers
+should reload before using the persister again. `onError` remains an optional
+notification mechanism; status listeners work without it:
+
+```ts
+persister.addSyncStatusListener((status) => {
+  const error = status.lastError as Error & { code?: string };
+  if (
+    status.phase === 'error' &&
+    error.code === 'indexeddb-connection-closed-for-upgrade'
+  ) {
+    showReloadRequiredScreen();
+  }
+});
+```
+
+Both error classes are exported from `tinybase-supabase` and expose
+`databaseName`, `currentVersion`, and `requestedVersion` fields. Prefer
+`error.code` as the stable discriminator rather than `instanceof` or the error
+message.
+
 With `realtime: true`, Postgres Changes only wakes a debounced authenticated
 pull. CRUD remains the write path. Startup, reconnect, manual, and safety pulls
 use the configured durable cursor, or the full-pull fallback, rather than
@@ -260,7 +296,8 @@ anonymous public data with and without RLS, Realtime and non-Realtime tables,
 and Chromium browser scenarios for offline reload, reconnect, Realtime,
 two-client server-arrival conflict resolution, durable CRDT rehydration, and
 concurrent Y.Text convergence. It also covers read-only CRDT hydration,
-Realtime following, blocked local uploads, and authoritative restart behavior.
+Realtime following, blocked local uploads, authoritative restart behavior, and
+real two-page IndexedDB upgrade blocking and cooperative connection closure.
 
 Formatting is enforced by Biome with four-width tabs, semicolons, single
 quotes, trailing commas, and no internal barrel files.
