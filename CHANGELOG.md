@@ -1,5 +1,11 @@
 # tinybase-supabase
 
+## 0.4.0
+
+### Minor Changes
+
+- 5b29d74: Accept TinyBase v8 or v9 as a peer dependency, and lift Yjs to 13.6.32 so TinyBase 9's optional peer is satisfied.
+
 ## 0.3.1
 
 ### Patch Changes
