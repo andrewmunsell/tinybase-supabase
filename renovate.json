@@ -1,0 +1,30 @@
+{
+	"$schema": "https://docs.renovatebot.com/renovate-schema.json",
+	"extends": ["config:best-practices", ":pinAllVersions", "helpers:pinGitHubActionDigests"],
+	"configMigration": true,
+	"platformAutomerge": true,
+	"lockFileMaintenance": {
+		"enabled": true,
+		"automerge": true
+	},
+	"packageRules": [
+		{
+			"description": "Keep peer dependency ranges semver-compatible for library consumers",
+			"matchDepTypes": ["peerDependencies"],
+			"rangeStrategy": "replace"
+		},
+		{
+			"description": "Automerge patch and minor updates at any time",
+			"matchUpdateTypes": ["patch", "minor"],
+			"automerge": true,
+			"automergeType": "pr",
+			"platformAutomerge": true,
+			"schedule": ["at any time"]
+		},
+		{
+			"description": "Route major updates through the dependency dashboard for manual approval",
+			"matchUpdateTypes": ["major"],
+			"dependencyDashboardApproval": true
+		}
+	]
+}
