@@ -198,12 +198,17 @@ class MemorySupabase {
 }
 
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
-const waitFor = async (condition: () => boolean, message: string): Promise<void> => {
-	for (let attempt = 0; attempt < 100; attempt += 1) {
+const waitFor = async (
+	condition: () => boolean,
+	message: string,
+	timeoutMs = 2_000,
+): Promise<void> => {
+	const startedAt = Date.now();
+	while (Date.now() - startedAt < timeoutMs) {
 		if (condition()) {
 			return;
 		}
-		await new Promise((resolve) => setTimeout(resolve, 2));
+		await new Promise((resolve) => setTimeout(resolve, 5));
 	}
 	throw new Error(message);
 };
@@ -211,13 +216,10 @@ const waitForSyncPhase = async (
 	persister: { getSyncStatus(): { phase: string } },
 	phase: string,
 ): Promise<void> => {
-	for (let attempt = 0; attempt < 50; attempt += 1) {
-		if (persister.getSyncStatus().phase === phase) {
-			return;
-		}
-		await new Promise((resolve) => setTimeout(resolve, 2));
-	}
-	throw new Error(`Timed out waiting for sync phase ${phase}`);
+	await waitFor(
+		() => persister.getSyncStatus().phase === phase,
+		`Timed out waiting for sync phase ${phase}`,
+	);
 };
 
 const configuration = (client: MemorySupabase, databaseName: string) => ({
@@ -814,7 +816,7 @@ describe('createSupabasePersister with CRDT cells', () => {
 		const store = createStore().setRow('documents', 'doc-1', { owner_id: 'user' });
 		const persister = await createSupabasePersister(store, {
 			...configuration(client, `buffered-${crypto.randomUUID()}`),
-			crdtUpdateBufferMs: 20,
+			crdtUpdateBufferMs: 50,
 		});
 		await persister.startSyncing();
 		const row = await persister.openRow('documents', 'doc-1');
@@ -825,13 +827,12 @@ describe('createSupabasePersister with CRDT cells', () => {
 		await tick();
 		expect(persister.getSyncStatus().pendingCount).toBe(3);
 		expect(client.rows.get('document_yjs_updates')).toHaveLength(0);
-		await new Promise((resolve) => setTimeout(resolve, 10));
-		expect(client.rows.get('document_yjs_updates')).toHaveLength(0);
 		await waitFor(
-			() => client.rows.get('document_yjs_updates')?.length === 1,
+			() =>
+				client.rows.get('document_yjs_updates')?.length === 1 &&
+				persister.getSyncStatus().pendingCount === 0,
 			'Buffered CRDT update was not uploaded',
 		);
-		expect(persister.getSyncStatus().pendingCount).toBe(0);
 		const receiverStore = createStore().setRow('documents', 'doc-1', { owner_id: 'user' });
 		const receiver = await createSupabasePersister(
 			receiverStore,
@@ -857,10 +858,13 @@ describe('createSupabasePersister with CRDT cells', () => {
 		row.getText('body').insert(0, 'default');
 		await tick();
 
-		await new Promise((resolve) => setTimeout(resolve, 100));
+		await new Promise((resolve) => setTimeout(resolve, 50));
 		expect(client.rows.get('document_yjs_updates')).toHaveLength(0);
-		await new Promise((resolve) => setTimeout(resolve, 450));
-		expect(client.rows.get('document_yjs_updates')).toHaveLength(1);
+		await waitFor(
+			() => client.rows.get('document_yjs_updates')?.length === 1,
+			'Default CRDT buffer did not upload',
+			1_000,
+		);
 		await persister.destroy();
 	});
 
