@@ -3,22 +3,174 @@ name: Release
 on:
   push:
     tags: ['v*']
+  pull_request_target:
+    branches: [main]
+    types: [closed]
 
 permissions:
   contents: read
 
 jobs:
-  verify:
-    uses: ./.github/workflows/ci.yml
+  prepare:
+    if: github.event_name == 'push' || github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    outputs:
+      prerelease: ${{ steps.release.outputs.prerelease }}
+      publish: ${{ steps.release.outputs.publish }}
+      ref: ${{ steps.release.outputs.ref }}
+      tag: ${{ steps.release.outputs.tag }}
+    steps:
+      - if: github.event_name == 'pull_request_target'
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+      - id: release
+        name: Detect version change
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REF_NAME: ${{ github.ref_name }}
+          RELEASE_SHA: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
 
-  release:
-    needs: verify
+          echo "ref=$RELEASE_SHA" >> "$GITHUB_OUTPUT"
+
+          if [[ "$EVENT_NAME" == "push" ]]; then
+            {
+              echo "prerelease=false"
+              echo "publish=true"
+              echo "tag=$REF_NAME"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git fetch --no-tags origin "$HEAD_SHA"
+          if [[ "$(git rev-parse FETCH_HEAD)" != "$HEAD_SHA" ]]; then
+            echo "Fetched pull request head does not match $HEAD_SHA" >&2
+            exit 1
+          fi
+
+          merge_base="$(git merge-base "${RELEASE_SHA}^1" "$HEAD_SHA")"
+          version_filter='.version | select(type == "string" and (test("[\u0000-\u001f\u007f]") | not))'
+          base_version="$(git show "${merge_base}:package.json" | jq -er "$version_filter")"
+          head_version="$(git show "${HEAD_SHA}:package.json" | jq -er "$version_filter")"
+          release_version="$(jq -er "$version_filter" package.json)"
+
+          if [[ "$base_version" == "$head_version" ]]; then
+            {
+              echo "prerelease=false"
+              echo "publish=false"
+              echo "tag="
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! prerelease="$(node - "$release_version" <<'NODE'
+          const version = process.argv[2];
+          const match = version.match(
+            /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/,
+          );
+          const coreIsSafe = match
+            ?.slice(1, 4)
+            .every((part) => Number.isSafeInteger(Number(part)));
+          const prereleaseIsValid = !match?.[4]
+            || match[4]
+              .split('.')
+              .every((part) => !/^\d+$/.test(part) || part === '0' || !part.startsWith('0'));
+
+          if (!match || version.length > 256 || !coreIsSafe || !prereleaseIsValid) {
+            process.exit(1);
+          }
+
+          process.stdout.write(match[4] ? 'true' : 'false');
+          NODE
+          )"; then
+            echo "package.json contains an invalid release version: $release_version" >&2
+            exit 1
+          fi
+
+          {
+            echo "prerelease=$prerelease"
+            echo "publish=true"
+            echo "tag=v$release_version"
+          } >> "$GITHUB_OUTPUT"
+
+  verify:
+    needs: prepare
+    if: needs.prepare.outputs.publish == 'true'
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.prepare.outputs.ref }}
+
+  tag:
+    needs: [prepare, verify]
+    if: needs.prepare.outputs.publish == 'true'
+    concurrency:
+      group: release-tag-${{ needs.prepare.outputs.tag }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Ensure release tag
+        env:
+          CREATE_TAG: ${{ github.event_name == 'pull_request_target' }}
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ needs.prepare.outputs.ref }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          resolve_tag() {
+            local sha
+            if sha="$(gh api \
+              -H "Accept: application/vnd.github.sha" \
+              "repos/${GH_REPO}/commits/refs/tags/${TAG}" 2>/dev/null)"; then
+              printf '%s\n' "$sha"
+            fi
+          }
+
+          tag_sha="$(resolve_tag)"
+          if [[ -z "$tag_sha" ]]; then
+            if [[ "$CREATE_TAG" != "true" ]]; then
+              echo "Release tag $TAG does not exist" >&2
+              exit 1
+            fi
+
+            gh api \
+              --method POST \
+              "repos/${GH_REPO}/git/refs" \
+              -f "ref=refs/tags/${TAG}" \
+              -f "sha=${RELEASE_SHA}" > /dev/null || true
+            tag_sha="$(resolve_tag)"
+          fi
+
+          if [[ -z "$tag_sha" ]]; then
+            echo "Unable to create release tag $TAG" >&2
+            exit 1
+          fi
+
+          if [[ "$tag_sha" != "$RELEASE_SHA" ]]; then
+            echo "$TAG already points to $tag_sha instead of $RELEASE_SHA" >&2
+            exit 1
+          fi
+
+  publish:
+    needs: [prepare, tag]
+    if: needs.prepare.outputs.publish == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       id-token: write
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.ref }}
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v6
         with:
@@ -27,4 +179,75 @@ jobs:
       - run: npm install --global npm@11.5.1
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
-      - run: npm publish
+      - name: Publish package
+        env:
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+          RELEASE_SHA: ${{ needs.prepare.outputs.ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          package_name="$(node -p "require('./package.json').name")"
+          package_version="$(node -p "require('./package.json').version")"
+          package_spec="${package_name}@${package_version}"
+          published_sha="$(npm view "$package_spec" gitHead 2>/dev/null || true)"
+
+          if [[ -n "$published_sha" ]]; then
+            if [[ "$published_sha" == "$RELEASE_SHA" ]]; then
+              echo "$package_spec is already published from $RELEASE_SHA"
+              exit 0
+            fi
+
+            echo "$package_spec is already published from $published_sha" >&2
+            exit 1
+          fi
+
+          publish_args=()
+          if [[ "$PRERELEASE" == "true" ]]; then
+            publish_args=(--tag next)
+          fi
+
+          if npm publish "${publish_args[@]}"; then
+            exit 0
+          fi
+
+          published_sha="$(npm view "$package_spec" gitHead 2>/dev/null || true)"
+          if [[ "$published_sha" == "$RELEASE_SHA" ]]; then
+            echo "$package_spec was published from $RELEASE_SHA by another run"
+            exit 0
+          fi
+
+          echo "Failed to publish $package_spec from $RELEASE_SHA" >&2
+          exit 1
+
+  github-release:
+    needs: [prepare, publish]
+    if: github.event_name == 'pull_request_target' && needs.prepare.outputs.publish == 'true'
+    concurrency:
+      group: release-github-${{ needs.prepare.outputs.tag }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create GitHub release
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            echo "GitHub release $TAG already exists"
+            exit 0
+          fi
+
+          release_args=("$TAG" --generate-notes --title "$TAG" --verify-tag)
+          if [[ "$PRERELEASE" == "true" ]]; then
+            release_args+=(--prerelease)
+          fi
+
+          gh release create "${release_args[@]}"
