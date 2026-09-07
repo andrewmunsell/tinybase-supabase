@@ -1,4 +1,4 @@
-import type { Content, Store, Table, Tables } from 'tinybase';
+import { type Content, createStore, type Store, type Table, type Tables } from 'tinybase';
 import { createCustomPersister, type Persister } from 'tinybase/persisters';
 import {
 	type IndexedDbConnectionClosedForUpgradeError,
@@ -7,9 +7,11 @@ import {
 import {
 	asError,
 	cloneContent,
+	contentEquals,
 	createPendingOperations,
 	fromRemote,
 	getRows,
+	mergeContentChanges,
 	operationId,
 	sortOperations,
 } from './standard/operations.js';
@@ -91,16 +93,46 @@ export const createStandardPersister = async (
 			if (pendingTerminalError && isIndexedDbConnectionClosedException(error)) {
 				return fallback;
 			}
+
 			throw error;
 		}
 	};
+
 	const [initialContent, initialOperations, initialRejected] = await Promise.all([
 		readDuringInitialization(() => state.getContent(), undefined),
 		readDuringInitialization(() => state.getOperations(), []),
 		readDuringInitialization(() => state.getRejected(), []),
 	]);
 	let lastContent = initialContent ?? store.getContent();
-	let listener: ((content?: Content) => void) | undefined;
+	let autoLoading = false;
+	let hasHydrated = false;
+	const initialStoreContent = cloneContent(store.getContent());
+	let localRevision = 0;
+	let basePersister: Persister;
+	let loadedPersistedContent = false;
+	let loadFallbackBaseline = initialStoreContent;
+	const loadFallback = (initialContent?: Content | (() => Content)) => () =>
+		loadedPersistedContent || initialContent === undefined
+			? store.getContent()
+			: mergeContentChanges(
+					typeof initialContent === 'function' ? initialContent() : initialContent,
+					loadFallbackBaseline,
+					store.getContent(),
+				);
+	let persistence: Promise<unknown> = Promise.resolve();
+	const revisionListener = store.addDidFinishTransactionListener(() => {
+		localRevision += 1;
+		if (hasHydrated && basePersister?.isAutoSaving() && basePersister.getStatus() === 1) {
+			void persistSerially(persistLocalChanges).catch(reportListenerError);
+		}
+	});
+
+	const persistSerially = <Value>(action: () => Promise<Value>): Promise<Value> => {
+		const next = persistence.then(action);
+		persistence = next.catch(() => undefined);
+		return next;
+	};
+
 	let isDestroyed = false;
 	let hasStartedSyncing = false;
 	let retryAttempt = 0;
@@ -135,9 +167,10 @@ export const createStandardPersister = async (
 	};
 
 	const setStatus = async (phase: SyncPhase, error?: Error): Promise<void> => {
-		if (terminalError) {
+		if (isDestroyed || terminalError) {
 			return;
 		}
+
 		const nextStatus: SyncStatus = {
 			lastError: error,
 			lastSuccessfulSyncAt: phase === 'idle' ? Date.now() : status.lastSuccessfulSyncAt,
@@ -145,7 +178,8 @@ export const createStandardPersister = async (
 			phase,
 			rejectedCount: (await state.getRejected()).length,
 		};
-		if (!terminalError) {
+
+		if (!isDestroyed && !terminalError) {
 			status = nextStatus;
 			emitStatus();
 		}
@@ -167,6 +201,7 @@ export const createStandardPersister = async (
 			if (terminalError) {
 				throw terminalError;
 			}
+
 			throw error;
 		}
 	};
@@ -177,19 +212,72 @@ export const createStandardPersister = async (
 	): Promise<void> => {
 		await state.persist(content, operations);
 		lastContent = cloneContent(content);
+		if (operations.length > 0) {
+			void syncNow().catch((error: unknown) => {
+				if (error !== terminalError) {
+					config.onError?.(asError(error));
+				}
+			});
+		}
 	};
 
 	const createOperations = (content: Content): PendingOperation[] =>
-		createPendingOperations(store, lastContent, content, tableConfigs);
+		createPendingOperations(lastContent, content, tableConfigs);
+
+	const persistLocalChanges = async (): Promise<void> => {
+		const content = cloneContent(store.getContent());
+		if (!contentEquals(content, lastContent)) {
+			await persistContent(content, createOperations(content));
+		}
+	};
 
 	const applyRemoteContent = async (
 		content: Content,
 		cursorKey: string,
-		cursor?: SyncCursor,
-	): Promise<void> => {
-		await state.replaceContent(content, cursorKey, cursor);
-		lastContent = cloneContent(content);
-		listener?.(content);
+		cursor: SyncCursor | undefined,
+		revision: number,
+	): Promise<boolean> => {
+		if (revision !== localRevision || isDestroyed || terminalError) {
+			return false;
+		}
+
+		const contentStore = createStore();
+		if (store.hasTablesSchema()) {
+			contentStore.setTablesSchema(JSON.parse(store.getTablesSchemaJson()));
+		}
+
+		if (store.hasValuesSchema()) {
+			contentStore.setValuesSchema(JSON.parse(store.getValuesSchemaJson()));
+		}
+
+		content = contentStore.setContent(cloneContent(content)).getContent();
+
+		const previousContent = lastContent;
+		const previousStore = cloneContent(store.getContent());
+		let applied = false;
+		try {
+			return await state.replaceContent(content, cursorKey, cursor, () => {
+				if (revision !== localRevision || isDestroyed || terminalError) {
+					return false;
+				}
+
+				// Apply synchronously; TinyBase's load listener can defer snapshots and skip saves.
+				lastContent = cloneContent(content);
+				applied = true;
+				if (autoLoading) {
+					store.setContent(cloneContent(content));
+				}
+
+				return true;
+			});
+		} catch (error) {
+			lastContent = previousContent;
+			if (applied && autoLoading) {
+				store.setContent(mergeContentChanges(previousStore, content, store.getContent()));
+			}
+
+			throw error;
+		}
 	};
 
 	const pullTable = async (tableId: string): Promise<void> => {
@@ -218,62 +306,93 @@ export const createStandardPersister = async (
 		const pulledCursorTime = pulledCursor ? Date.parse(pulledCursor.updatedAt) : Number.NaN;
 		const nextCursor = cursor && pulledCursorTime <= cursorTime ? cursor : pulledCursor;
 
-		const content = cloneContent((await state.getContent()) ?? lastContent);
-		const table: Table = { ...getRows(content, tableId) };
-		const [pending, blocked] = await Promise.all([
-			state.getOperations(),
-			state.getBlockedOperations(),
-		]);
-		const blockedIds = new Set([...pending, ...blocked].map((operation) => operation.id));
-		const seen = new Set<string>();
-		const deletedAtColumn = tableConfig.deletedAtColumn ?? 'deleted_at';
-
-		for (const remote of rows) {
-			const [rowId, row] = fromRemote(tableConfig, remote);
-			seen.add(rowId);
-			if (blockedIds.has(operationId(tableId, rowId))) {
-				continue;
-			}
-			if (remote[deletedAtColumn] !== null && remote[deletedAtColumn] !== undefined) {
-				delete table[rowId];
-			} else {
-				table[rowId] = row;
-			}
-		}
-
-		if (!cursor) {
-			for (const rowId of Object.keys(table)) {
-				if (!seen.has(rowId) && !blockedIds.has(operationId(tableId, rowId))) {
-					delete table[rowId];
+		while (!isDestroyed && !terminalError) {
+			const applied = await persistSerially(async () => {
+				const revision = localRevision;
+				if (autoLoading && hasHydrated) {
+					await persistLocalChanges();
 				}
+
+				const content = cloneContent((await state.getContent()) ?? lastContent);
+				const table: Table = { ...getRows(content, tableId) };
+				const [pending, blocked] = await Promise.all([
+					state.getOperations(),
+					state.getBlockedOperations(),
+				]);
+				const blockedIds = new Set(
+					[...pending, ...blocked].map((operation) => operation.id),
+				);
+				const seen = new Set<string>();
+				const deletedAtColumn = tableConfig.deletedAtColumn ?? 'deleted_at';
+
+				for (const remote of rows) {
+					const [rowId, row] = fromRemote(tableConfig, remote);
+					seen.add(rowId);
+					if (blockedIds.has(operationId(tableId, rowId))) {
+						continue;
+					}
+
+					if (remote[deletedAtColumn] !== null && remote[deletedAtColumn] !== undefined) {
+						delete table[rowId];
+					} else {
+						table[rowId] = row;
+					}
+				}
+
+				if (!cursor) {
+					for (const rowId of Object.keys(table)) {
+						if (!seen.has(rowId) && !blockedIds.has(operationId(tableId, rowId))) {
+							delete table[rowId];
+						}
+					}
+				}
+
+				const tables: Tables = { ...content[0] };
+				if (Object.keys(table).length === 0) {
+					delete tables[tableId];
+				} else {
+					tables[tableId] = table;
+				}
+
+				return applyRemoteContent([tables, content[1]], cursorKey, nextCursor, revision);
+			});
+
+			if (applied) {
+				return;
 			}
 		}
-
-		const tables: Tables = { ...content[0] };
-		if (Object.keys(table).length === 0) {
-			delete tables[tableId];
-		} else {
-			tables[tableId] = table;
-		}
-		await applyRemoteContent([tables, content[1]], cursorKey, nextCursor);
 	};
 
 	const flushOutbox = async (): Promise<void> => {
 		const operations = sortOperations(await state.getOperations(), tableConfigs);
 		for (const operation of operations) {
+			if (isDestroyed || terminalError) {
+				return;
+			}
+
 			const tableConfig = tableConfigs[operation.tableId];
 			if (!tableConfig) {
-				await state.removeOperation(operation.id);
+				await state.removeOperation(operation);
 				continue;
 			}
+
 			try {
 				await transport.upsert(tableConfig, operation.payload);
-				await state.removeOperation(operation.id);
+				if (isDestroyed || terminalError) {
+					return;
+				}
+
+				await state.removeOperation(operation);
 			} catch (error) {
+				if (isDestroyed || terminalError) {
+					return;
+				}
+
 				if (isPermanentError(error as Parameters<typeof isPermanentError>[0])) {
 					await state.reject(operation, asError(error).message);
 					continue;
 				}
+
 				throw error;
 			}
 		}
@@ -287,15 +406,17 @@ export const createStandardPersister = async (
 		if (isDestroyed || terminalError) {
 			return;
 		}
+
 		const delay = Math.min(retryBaseDelayMs * 2 ** retryAttempt, retryMaxDelayMs);
 		retryAttempt += 1;
 		scheduler.schedule(delay);
 	};
 
 	const reportSyncError = async (error: unknown): Promise<void> => {
-		if (terminalError) {
+		if (isDestroyed || terminalError) {
 			return;
 		}
+
 		const normalized = asError(error);
 		config.onError?.(normalized);
 		await setStatus('offline', normalized);
@@ -303,9 +424,10 @@ export const createStandardPersister = async (
 	};
 
 	const completeSync = async (): Promise<void> => {
-		if (terminalError) {
+		if (isDestroyed || terminalError) {
 			return;
 		}
+
 		clearRetry();
 		await setStatus('idle');
 	};
@@ -314,15 +436,22 @@ export const createStandardPersister = async (
 		if (isDestroyed || terminalError) {
 			return false;
 		}
+
 		await setStatus('syncing');
 		try {
 			await flushOutbox();
 			for (const tableId of Object.keys(tableConfigs)) {
+				if (isDestroyed || terminalError) {
+					return false;
+				}
+
 				await pullTable(tableId);
 			}
+
 			if (markIdle) {
 				await completeSync();
 			}
+
 			return true;
 		} catch (error) {
 			await reportSyncError(error);
@@ -336,6 +465,7 @@ export const createStandardPersister = async (
 		if (terminalError) {
 			return;
 		}
+
 		const realtime = tableConfigs[tableId]?.realtime;
 		if (realtime) {
 			const delay = typeof realtime === 'object' ? (realtime.debounceMs ?? 200) : 200;
@@ -375,6 +505,7 @@ export const createStandardPersister = async (
 			if (isDestroyed || hasStartedSyncing) {
 				return;
 			}
+
 			hasStartedSyncing = true;
 			startRealtime();
 			await scheduler.start(config.pollIntervalMs ?? defaultPollIntervalMs);
@@ -385,6 +516,7 @@ export const createStandardPersister = async (
 		if (terminalError) {
 			return;
 		}
+
 		terminalError = error;
 		hasStartedSyncing = false;
 		clearRetry();
@@ -401,31 +533,46 @@ export const createStandardPersister = async (
 			lastError: error,
 			phase: 'error',
 		};
+
 		onTerminal?.(error);
 		emitStatus();
 	};
 
-	const basePersister = createCustomPersister(
+	basePersister = createCustomPersister(
 		store,
-		async () => state.getContent(),
-		async (getContent) => {
-			const content = getContent();
-			const operations = createOperations(content);
-			await persistContent(content, operations);
-			if (operations.length > 0) {
-				void syncNow().catch((error: unknown) => {
-					if (error !== terminalError) {
-						config.onError?.(asError(error));
-					}
-				});
-			}
-		},
-		(nextListener) => {
-			listener = nextListener;
+		async () => {
+			await persistSerially(async () => {
+				const before = hasHydrated ? cloneContent(store.getContent()) : initialStoreContent;
+				const persisted = await state.getContent();
+				loadedPersistedContent = persisted !== undefined;
+				loadFallbackBaseline = before;
+				const content = cloneContent(persisted ?? store.getContent());
+				const current = store.getContent();
+				const merged = mergeContentChanges(content, before, current);
+
+				if (!isDestroyed && !terminalError) {
+					lastContent = content;
+					store.setContent(merged);
+					hasHydrated = true;
+					await persistLocalChanges();
+				}
+			});
+
+			// Application occurs above; TinyBase has no deferred snapshot to apply.
 			return undefined;
 		},
+		async () => {
+			await persistSerially(async () => {
+				const content = cloneContent(store.getContent());
+				await persistContent(content, createOperations(content));
+			});
+		},
 		() => {
-			listener = undefined;
+			autoLoading = true;
+			return true;
+		},
+		() => {
+			autoLoading = false;
 		},
 		config.onError,
 	);
@@ -469,8 +616,10 @@ export const createStandardPersister = async (
 		async destroy(): Promise<StandardPersister> {
 			isDestroyed = true;
 			await stopSyncing();
-			state.close();
 			await baseDestroy();
+			await persistence;
+			store.delListener(revisionListener);
+			state.close();
 			return result;
 		},
 		async getRejectedOperations(): Promise<readonly RejectedOperation[]> {
@@ -498,7 +647,8 @@ export const createStandardPersister = async (
 				);
 			});
 		},
-		load: guardBaseMethod(baseLoad),
+		load: (initialContent?: Content | (() => Content)) =>
+			runWhileUsable(() => baseLoad(loadFallback(initialContent))),
 		async retryRejected(): Promise<void> {
 			await runWhileUsable(async () => {
 				await state.retryRejected();
@@ -507,9 +657,18 @@ export const createStandardPersister = async (
 		},
 		reconcile,
 		reportSyncError,
-		save: guardBaseMethod(baseSave),
+		save: (...arguments_: Parameters<Persister['save']>) =>
+			runWhileUsable(async () => {
+				if (basePersister.getStatus() === 1) {
+					await persistSerially(persistLocalChanges);
+					return basePersister;
+				}
+
+				return baseSave(...arguments_);
+			}),
 		schedule: guardBaseMethod(baseSchedule),
-		startAutoLoad: guardBaseMethod(baseStartAutoLoad),
+		startAutoLoad: (initialContent?: Content | (() => Content)) =>
+			runWhileUsable(() => baseStartAutoLoad(loadFallback(initialContent))),
 		startAutoSave: guardBaseMethod(baseStartAutoSave),
 		startSyncing,
 		async startAutoPersisting(): Promise<StandardPersister> {
@@ -525,6 +684,7 @@ export const createStandardPersister = async (
 					await baseStopAutoPersisting(true);
 					throw terminalError;
 				}
+
 				throw error;
 			}
 		},
@@ -537,6 +697,7 @@ export const createStandardPersister = async (
 	if (pendingTerminalError) {
 		terminate(pendingTerminalError);
 	}
+
 	await setStatus('idle');
 	return result;
 };

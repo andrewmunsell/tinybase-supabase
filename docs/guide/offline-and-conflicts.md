@@ -5,6 +5,34 @@ operation. The persister then tries Supabase. If the browser is offline, it
 retries with capped exponential backoff and again on browser reconnect or tab
 focus.
 
+## Local persistence and synchronization completion
+
+Remote pulls preserve newer local edits, including edits in other tables and
+row deletions. Snapshot reads, operation generation, and durable content
+replacement share a local persistence queue. Network requests run outside it,
+so an in-flight upload does not block local saves.
+
+Before committing a remote replacement, the persister checks whether the local
+store changed during its IndexedDB work. If it changed, the transaction aborts
+without advancing the cursor and reconciliation retries against current local
+content. Accepted remote content applies synchronously to the store. A failed
+commit restores the previous baseline while preserving subsequent local edits.
+Hydration also preserves edits made while reading IndexedDB. Saves during
+loading persist through the same local queue.
+
+A successful `syncNow()` finishes after remote content has applied and its
+IndexedDB transaction has committed, including hybrid metadata and open CRDT
+projections. As with background synchronization, a transport failure is reported
+through `onError` and sync status and schedules a retry; resolution alone does
+not mean every write was accepted. Inspect `getSyncStatus()` for pending or
+rejected operations and failures. With automatic loading stopped, pulls update
+durable content and `load()` applies it to the store.
+
+Each coalesced row operation has a revision. A remote response acknowledges or
+rejects only the revision sent in that request. If another local write replaces
+it while the request is in flight, that newer operation remains pending. This
+also applies to tombstones. Existing IndexedDB databases retain queued operations without a schema change.
+
 ## Conflict rule
 
 Ordinary cells synchronized through direct Supabase CRUD use **whole-row,

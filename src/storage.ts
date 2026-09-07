@@ -1,5 +1,5 @@
 import { type DBSchema, type IDBPDatabase, openDB } from 'idb';
-import type { Content } from 'tinybase';
+import { type Content, createStore } from 'tinybase';
 import {
 	getIndexedDbLifecycleCallbacks,
 	type IndexedDbConnectionClosedForUpgradeError,
@@ -7,6 +7,7 @@ import {
 
 export interface PendingOperation {
 	readonly id: string;
+	readonly revision?: string;
 	readonly kind: 'upsert' | 'tombstone';
 	readonly payload: Record<string, unknown>;
 	readonly rowId: string;
@@ -69,6 +70,7 @@ export class LocalState {
 					upgradeDatabase.createObjectStore('outbox');
 					upgradeDatabase.createObjectStore('rejected');
 				}
+
 				if (oldVersion < 2) {
 					upgradeDatabase.createObjectStore('cursors');
 				}
@@ -83,7 +85,9 @@ export class LocalState {
 	}
 
 	async getContent(): Promise<Content | undefined> {
-		return this.#database.get('content', 'store');
+		const content = await this.#database.get('content', 'store');
+		// Decode TinyBase 9 JSON cells saved by older custom-persister callbacks.
+		return content ? createStore().setJson(JSON.stringify(content)).getContent() : undefined;
 	}
 
 	async getCursor(cursorKey: string): Promise<SyncCursor | undefined> {
@@ -102,8 +106,14 @@ export class LocalState {
 		return this.#database.getAll('rejected');
 	}
 
-	async removeOperation(id: string): Promise<void> {
-		await this.#database.delete('outbox', id);
+	async removeOperation(operation: PendingOperation): Promise<void> {
+		const transaction = this.#database.transaction('outbox', 'readwrite');
+		const current = await transaction.store.get(operation.id);
+		if (current && current.revision === operation.revision) {
+			await transaction.store.delete(operation.id);
+		}
+
+		await transaction.done;
 	}
 
 	async persist(content: Content, operations: readonly PendingOperation[]): Promise<void> {
@@ -121,19 +131,45 @@ export class LocalState {
 		await transaction.done;
 	}
 
-	async replaceContent(content: Content, cursorKey: string, cursor?: SyncCursor): Promise<void> {
+	async replaceContent(
+		content: Content,
+		cursorKey: string,
+		cursor: SyncCursor | undefined,
+		apply: () => boolean,
+	): Promise<boolean> {
 		const transaction = this.#database.transaction(['content', 'cursors'], 'readwrite');
-		await transaction.objectStore('content').put(content, 'store');
-		if (cursor) {
-			await transaction.objectStore('cursors').put(cursor, cursorKey);
+		try {
+			await transaction.objectStore('content').put(content, 'store');
+			if (cursor) {
+				await transaction.objectStore('cursors').put(cursor, cursorKey);
+			}
+
+			// Validate and apply synchronously while the durable replacement can still abort.
+			if (!apply()) {
+				transaction.abort();
+				await transaction.done.catch(() => undefined);
+				return false;
+			}
+
+			await transaction.done;
+			return true;
+		} catch (error) {
+			try {
+				transaction.abort();
+			} catch {}
+			await transaction.done.catch(() => undefined);
+			throw error;
 		}
-		await transaction.done;
 	}
 
 	async reject(operation: PendingOperation, error: string): Promise<void> {
 		const transaction = this.#database.transaction(['outbox', 'rejected'], 'readwrite');
-		await transaction.objectStore('outbox').delete(operation.id);
-		await transaction.objectStore('rejected').put({ ...operation, error }, operation.id);
+		const current = await transaction.objectStore('outbox').get(operation.id);
+		if (current && current.revision === operation.revision) {
+			await transaction.objectStore('outbox').delete(operation.id);
+			await transaction.objectStore('rejected').put({ ...operation, error }, operation.id);
+		}
+
 		await transaction.done;
 	}
 
@@ -160,6 +196,7 @@ export class LocalState {
 				await store.put({ ...operation, discarded: true }, operation.id);
 			}
 		}
+
 		await transaction.done;
 	}
 }

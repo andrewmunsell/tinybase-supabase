@@ -1,11 +1,13 @@
 import 'fake-indexeddb/auto';
 import { jest } from '@jest/globals';
 import { openDB } from 'idb';
-import { createStore } from 'tinybase';
+import { createStore, type Row } from 'tinybase';
+import { createCustomPersister } from 'tinybase/persisters';
 import {
 	createSupabasePersister,
 	IndexedDbConnectionClosedForUpgradeError,
 } from '../../src/index.js';
+import { StandardTransport } from '../../src/standard/protocol.js';
 import { LocalState } from '../../src/storage.js';
 
 type RemoteRow = Record<string, unknown>;
@@ -78,8 +80,10 @@ class MemoryQuery implements PromiseLike<{ data: RemoteRow[]; error: null }> {
 					return comparison;
 				}
 			}
+
 			return 0;
 		});
+
 		return Promise.resolve({
 			data: ordered.slice(this.#from, this.#to + 1),
 			error: null,
@@ -119,6 +123,7 @@ class MemorySupabase {
 				for (const row of rows.values()) {
 					row.deleted_at ??= null;
 				}
+
 				return new MemoryQuery(
 					[...rows.values()],
 					(column, value) => this.cursorQueries.push({ column, table, value }),
@@ -129,15 +134,18 @@ class MemorySupabase {
 				if (this.permanentError) {
 					return { data: null, error: this.permanentError };
 				}
+
 				if (this.transientError) {
 					return { data: null, error: this.transientError };
 				}
+
 				rows.set(String(payload.id), {
 					...rows.get(String(payload.id)),
 					deleted_at: null,
 					...payload,
 					updated_at: this.nextUpdatedAt(),
 				});
+
 				return { data: null, error: null };
 			},
 		};
@@ -148,6 +156,7 @@ class MemorySupabase {
 			callback: () => undefined,
 			table: '',
 		};
+
 		const channel = {
 			on: (
 				_type: 'postgres_changes',
@@ -162,6 +171,7 @@ class MemorySupabase {
 				this.channels.push(state);
 			},
 		};
+
 		return channel;
 	}
 
@@ -197,6 +207,643 @@ const fullPullConfiguration = (client: MemorySupabase, databaseName: string) => 
 	},
 });
 
+// TinyBase 8 uses application codecs for JSON cells; TinyBase 9 stores them directly.
+const supportsJsonCells = createStore()
+	.setCell('probe', 'row', 'cell', { value: true })
+	.hasCell('probe', 'row', 'cell');
+const localPreferences = (liveUpdates: boolean) =>
+	supportsJsonCells ? { liveUpdates } : JSON.stringify({ liveUpdates });
+const jsonCodec = supportsJsonCells
+	? {}
+	: {
+			toRemote: (_rowId: string, row: Row) => ({
+				...row,
+				...(typeof row.preferences === 'string'
+					? { preferences: JSON.parse(row.preferences) }
+					: {}),
+			}),
+			fromRemote: (row: RemoteRow): readonly [string, Row] => {
+				const {
+					id,
+					deleted_at: _deleted,
+					updated_at: _updated,
+					preferences,
+					...cells
+				} = row;
+				return [
+					String(id),
+					{
+						...cells,
+						...(preferences === undefined
+							? {}
+							: { preferences: JSON.stringify(preferences) }),
+					} as Row,
+				];
+			},
+		};
+
+const gate = () => {
+	let release!: () => void;
+	const promise = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+
+	return { promise, release };
+};
+
+describe.each([false, true])('concurrent writes (hybrid=%s)', (hybrid) => {
+	const setup = async () => {
+		const client = new MemorySupabase();
+		client.rows.set(
+			'todos',
+			new Map([
+				[
+					'row-1',
+					{
+						id: 'row-1',
+						preferences: { liveUpdates: true },
+						title: 'initial',
+						deleted_at: null,
+						updated_at: client.nextUpdatedAt(),
+					},
+				],
+			]),
+		);
+		const config = {
+			...configuration(client, `concurrency-${crypto.randomUUID()}`),
+			onError: jest.fn<(error: Error) => void>(),
+			cursorLookbackMs: 0,
+			tables: {
+				todos: { ...configuration(client, '').tables.todos, ...jsonCodec },
+				other: { table: 'other', ...jsonCodec },
+				...(hybrid
+					? {
+							documents: {
+								table: 'documents',
+								crdtCells: { body: { type: 'text' as const } },
+								crdtUpdatesTable: 'updates',
+							},
+						}
+					: {}),
+			},
+		};
+
+		const store = createStore();
+		const persister = await createSupabasePersister(store, config);
+		await persister.startAutoPersisting();
+		await persister.stopAutoSave();
+		const state = await LocalState.open(config.databaseName, config.scopeKey);
+		return { client, config, store, persister, state };
+	};
+
+	it.each([
+		'todos',
+		'other',
+	])('retains a local edit in %s after reading a remote content snapshot', async (tableId) => {
+		const { client, config, store, persister, state } = await setup();
+		const entered = gate();
+		const release = gate();
+		const original = LocalState.prototype.getContent;
+		const spy = jest
+			.spyOn(LocalState.prototype, 'getContent')
+			.mockImplementationOnce(async function (this: LocalState) {
+				const content = await original.call(this);
+				entered.release();
+				await release.promise;
+				return content;
+			});
+
+		const syncing = persister.syncNow();
+		await entered.promise;
+		store.setRow(tableId, 'row-1', { preferences: localPreferences(false) });
+		const saving = persister.save();
+		client.transientError = { message: 'offline', status: 503 };
+		release.release();
+		await Promise.all([saving, syncing]);
+		spy.mockRestore();
+		try {
+			expect(store.getRow(tableId, 'row-1')).toEqual({
+				preferences: localPreferences(false),
+			});
+
+			expect((await state.getContent())?.[0][tableId]?.['row-1']).toEqual(
+				store.getRow(tableId, 'row-1'),
+			);
+			expect(await state.getOperations()).toEqual([
+				expect.objectContaining({ tableId, rowId: 'row-1' }),
+			]);
+			await persister.destroy();
+			const reopenedStore = createStore();
+			const reopened = await createSupabasePersister(reopenedStore, config);
+			await reopened.startAutoPersisting();
+			expect(reopenedStore.getRow(tableId, 'row-1')).toEqual({
+				preferences: { liveUpdates: false },
+			});
+
+			client.transientError = undefined;
+			await reopened.syncNow();
+			expect(client.rows.get(tableId)?.get('row-1')?.preferences).toEqual({
+				liveUpdates: false,
+			});
+
+			await reopened.destroy();
+		} finally {
+			state.close();
+			await persister.destroy();
+		}
+	});
+
+	it.each([
+		'accepted',
+		'rejected',
+		'tombstone',
+		'rejected-tombstone',
+	])('keeps revision B when in-flight A is %s', async (outcome) => {
+		const { client, config, store, persister, state } = await setup();
+		const entered = gate();
+		const release = gate();
+		const original = StandardTransport.prototype.upsert;
+		const spy = jest
+			.spyOn(StandardTransport.prototype, 'upsert')
+			.mockImplementationOnce(async function (this: StandardTransport, config, payload) {
+				entered.release();
+				await release.promise;
+				if (outcome.includes('rejected')) {
+					throw { message: 'denied A', code: '42501' };
+				}
+
+				await original.call(this, config, payload);
+				client.transientError = { message: 'offline B', status: 503 };
+			});
+
+		store.setCell('todos', 'row-1', 'title', 'A');
+		await persister.save();
+		await entered.promise;
+		if (outcome.includes('tombstone')) {
+			store.delRow('todos', 'row-1');
+		} else {
+			store.setCell('todos', 'row-1', 'title', 'B');
+		}
+
+		await persister.save();
+		if (outcome.includes('rejected')) {
+			client.transientError = { message: 'offline B', status: 503 };
+		}
+
+		release.release();
+		await persister.syncNow();
+		spy.mockRestore();
+		try {
+			expect(await state.getOperations()).toEqual([
+				expect.objectContaining(
+					outcome.includes('tombstone')
+						? { kind: 'tombstone' }
+						: { payload: expect.objectContaining({ title: 'B' }) },
+				),
+			]);
+			expect(await state.getRejected()).toEqual([]);
+			await persister.destroy();
+			const reopenedStore = createStore();
+			const reopened = await createSupabasePersister(reopenedStore, config);
+			await reopened.startAutoPersisting();
+			expect(reopenedStore.getCell('todos', 'row-1', 'title')).toBe(
+				outcome.includes('tombstone') ? undefined : 'B',
+			);
+			client.transientError = undefined;
+			await reopened.syncNow();
+			const remote = client.rows.get('todos')?.get('row-1');
+			if (outcome.includes('tombstone')) {
+				expect(remote?.deleted_at).toEqual(expect.any(String));
+			} else {
+				expect(remote?.title).toBe('B');
+			}
+
+			await reopened.destroy();
+		} finally {
+			state.close();
+			await persister.destroy();
+		}
+	});
+
+	it('aborts durable replacement without advancing its cursor or losing an unsaved edit', async () => {
+		const { client, store, persister, state } = await setup();
+		const oldRow = client.rows.get('todos')?.get('row-1');
+		client.rows.get('todos')?.set('row-2', {
+			id: 'row-2',
+			title: 'unapplied',
+			deleted_at: null,
+			updated_at: client.nextUpdatedAt(),
+		});
+
+		const put = IDBObjectStore.prototype.put;
+		let injected = false;
+		const write = jest.spyOn(IDBObjectStore.prototype, 'put').mockImplementation(function (
+			this: IDBObjectStore,
+			...args
+		) {
+			const request = put.apply(this, args);
+			if (this.name === 'content' && !injected) {
+				injected = true;
+				request.addEventListener(
+					'success',
+					() => store.setCell('todos', 'row-1', 'title', 'unsaved edit'),
+					{ once: true },
+				);
+			}
+
+			return request;
+		});
+
+		const replace = LocalState.prototype.replaceContent;
+		let applied: unknown;
+		const replacement = jest
+			.spyOn(LocalState.prototype, 'replaceContent')
+			.mockImplementationOnce(async function (this: LocalState, ...args) {
+				applied = await replace.apply(this, args);
+				throw new Error('Controlled interruption after the replacement attempt');
+			});
+
+		await persister.syncNow();
+		write.mockRestore();
+		replacement.mockRestore();
+		try {
+			expect(applied).toBe(false);
+			expect(store.getCell('todos', 'row-1', 'title')).toBe('unsaved edit');
+			expect(store.hasRow('todos', 'row-2')).toBe(false);
+			const cursorKey = JSON.stringify([
+				'todos',
+				'todos',
+				'id',
+				'deleted_at',
+				'updated_at',
+				'*',
+				'',
+			]);
+			expect(await state.getCursor(cursorKey)).toEqual({ updatedAt: oldRow?.updated_at });
+			await persister.save();
+			expect((await state.getContent())?.[0].todos?.['row-1']?.title).toBe('unsaved edit');
+			expect((await state.getOperations()).map((op) => op.rowId)).toEqual(['row-1']);
+			await persister.syncNow();
+			expect(store.getCell('todos', 'row-2', 'title')).toBe('unapplied');
+			expect(client.rows.get('todos')?.get('row-1')?.title).toBe('unsaved edit');
+			store.delRow('todos', 'row-2');
+			await persister.save();
+			await persister.syncNow();
+			expect(client.rows.get('todos')?.get('row-2')?.deleted_at).toEqual(expect.any(String));
+		} finally {
+			state.close();
+			await persister.destroy();
+		}
+	});
+
+	it.each([
+		'load',
+		'startAutoLoad',
+	] as const)('preserves edits and saves while %s is awaiting storage', async (method) => {
+		const { store, persister, state } = await setup();
+		const entered = gate();
+		const release = gate();
+		const original = LocalState.prototype.getContent;
+		const read = jest
+			.spyOn(LocalState.prototype, 'getContent')
+			.mockImplementationOnce(async function (this: LocalState) {
+				const content = await original.call(this);
+				entered.release();
+				await release.promise;
+				return content;
+			});
+
+		const loading = persister[method]();
+		await entered.promise;
+		store.setCell('todos', 'row-1', 'title', 'during loading');
+		const saving = persister.save();
+		release.release();
+		await Promise.all([loading, saving]);
+		read.mockRestore();
+		try {
+			expect(store.getCell('todos', 'row-1', 'title')).toBe('during loading');
+			expect((await state.getContent())?.[0].todos?.['row-1']?.title).toBe('during loading');
+			await persister.syncNow();
+		} finally {
+			state.close();
+			await persister.destroy();
+		}
+	});
+
+	it.each([
+		'edit',
+		'delete',
+	])('restores the baseline and local %s after a transaction aborts after application', async (change) => {
+		const { client, store, persister, state } = await setup();
+		client.rows.get('todos')?.set('row-2', {
+			id: 'row-2',
+			title: 'remote',
+			deleted_at: null,
+			updated_at: client.nextUpdatedAt(),
+		});
+
+		let transaction: IDBTransaction | undefined;
+		const put = IDBObjectStore.prototype.put;
+		const write = jest.spyOn(IDBObjectStore.prototype, 'put').mockImplementation(function (
+			this: IDBObjectStore,
+			...args
+		) {
+			if (this.name === 'content') {
+				transaction = this.transaction;
+			}
+
+			return put.apply(this, args);
+		});
+
+		const replace = LocalState.prototype.replaceContent;
+		const replacement = jest
+			.spyOn(LocalState.prototype, 'replaceContent')
+			.mockImplementationOnce(async function (this: LocalState, content, key, cursor, apply) {
+				return replace.call(this, content, key, cursor, () => {
+					const applied = apply();
+					if (change === 'delete') {
+						store.delRow('todos', 'row-1');
+					} else {
+						store.setCell('todos', 'row-1', 'title', 'newer edit');
+					}
+
+					transaction?.abort();
+					return applied;
+				});
+			});
+
+		await persister.syncNow();
+		write.mockRestore();
+		replacement.mockRestore();
+		try {
+			expect(store.getCell('todos', 'row-1', 'title')).toBe(
+				change === 'delete' ? undefined : 'newer edit',
+			);
+			expect(store.hasRow('todos', 'row-2')).toBe(false);
+			client.transientError = { message: 'offline', status: 503 };
+			await persister.save();
+			expect((await state.getOperations()).map((operation) => operation.rowId)).toEqual([
+				'row-1',
+			]);
+			client.transientError = undefined;
+			await persister.syncNow();
+			expect(store.getCell('todos', 'row-2', 'title')).toBe('remote');
+		} finally {
+			state.close();
+			await persister.destroy();
+		}
+	});
+
+	it('preserves startup edits and allows synchronization inside the TinyBase scheduler', async () => {
+		const { client, config, store, persister, state } = await setup();
+		await persister.destroy();
+		const reopenedStore = createStore();
+		const reopened = await createSupabasePersister(reopenedStore, config);
+		const entered = gate();
+		const release = gate();
+		const original = LocalState.prototype.getContent;
+		const read = jest
+			.spyOn(LocalState.prototype, 'getContent')
+			.mockImplementationOnce(async function (this: LocalState) {
+				const content = await original.call(this);
+				entered.release();
+				await release.promise;
+				return content;
+			});
+
+		const starting = reopened.startAutoPersisting();
+		await entered.promise;
+		reopenedStore.setRow('other', 'local', { title: 'startup' });
+		const saving = reopened.save();
+		release.release();
+		await Promise.all([starting, saving]);
+		read.mockRestore();
+		try {
+			expect(reopenedStore.getCell('other', 'local', 'title')).toBe('startup');
+			expect(reopenedStore.getRow('todos', 'row-1')).toEqual(store.getRow('todos', 'row-1'));
+			client.rows.get('todos')?.set('row-2', {
+				id: 'row-2',
+				title: 'scheduled remote',
+				deleted_at: null,
+				updated_at: client.nextUpdatedAt(),
+			});
+
+			await reopened.schedule(() => reopened.syncNow());
+			expect(reopenedStore.getCell('todos', 'row-2', 'title')).toBe('scheduled remote');
+			reopenedStore.setCell('todos', 'row-2', 'title', 'after scheduler');
+			await reopened.save();
+			await reopened.syncNow();
+			expect((await state.getContent())?.[0].todos?.['row-2']?.title).toBe('after scheduler');
+		} finally {
+			state.close();
+			await reopened.destroy();
+		}
+	});
+
+	it('keeps an edit made while a pull persists an earlier unsaved edit', async () => {
+		const { store, persister, state } = await setup();
+		store.setCell('todos', 'row-1', 'title', 'first unsaved');
+		const entered = gate();
+		const release = gate();
+		const original = LocalState.prototype.persist;
+		const write = jest
+			.spyOn(LocalState.prototype, 'persist')
+			.mockImplementationOnce(async function (this: LocalState, ...args) {
+				entered.release();
+				await release.promise;
+				return original.apply(this, args);
+			});
+
+		const syncing = persister.syncNow();
+		const reachedPersistence = await Promise.race([
+			entered.promise.then(() => true),
+			syncing.then(() => false),
+		]);
+		if (!reachedPersistence) {
+			write.mockRestore();
+			try {
+				expect(store.getCell('todos', 'row-1', 'title')).toBe('first unsaved');
+			} finally {
+				state.close();
+				await persister.destroy();
+			}
+
+			return;
+		}
+
+		store.setCell('todos', 'row-1', 'title', 'second unsaved');
+		release.release();
+		await syncing;
+		write.mockRestore();
+		try {
+			expect(store.getCell('todos', 'row-1', 'title')).toBe('second unsaved');
+			expect((await state.getContent())?.[0].todos?.['row-1']?.title).toBe('second unsaved');
+		} finally {
+			state.close();
+			await persister.destroy();
+		}
+	});
+
+	it('keeps native load defaults and immediate auto-load cancellation', async () => {
+		const { store, persister, state } = await setup();
+		const fallback = jest.fn(() => [{}, {}] as ReturnType<typeof store.getContent>);
+		await persister.load(fallback);
+		expect(fallback).not.toHaveBeenCalled();
+		const starting = persister.startAutoLoad();
+		await persister.stopAutoLoad();
+		await starting;
+		const native = createCustomPersister(
+			createStore(),
+			async () => undefined,
+			async () => undefined,
+			() => true,
+			() => undefined,
+		);
+		await native.startAutoLoad();
+		const nativeStarting = native.startAutoLoad();
+		await native.stopAutoLoad();
+		await nativeStarting;
+		expect(persister.isAutoLoading()).toBe(native.isAutoLoading());
+		await native.destroy();
+		state.close();
+		await persister.destroy();
+	});
+
+	it('ignores a remote response after destruction', async () => {
+		const { config, persister, state } = await setup();
+		const entered = gate();
+		const release = gate();
+		const original = StandardTransport.prototype.fetchRows;
+		const fetch = jest
+			.spyOn(StandardTransport.prototype, 'fetchRows')
+			.mockImplementationOnce(async function (this: StandardTransport, ...args) {
+				const result = await original.apply(this, args);
+				entered.release();
+				await release.promise;
+				return result;
+			});
+
+		const syncing = persister.syncNow();
+		await entered.promise;
+		await persister.destroy();
+		release.release();
+		await syncing;
+		fetch.mockRestore();
+		state.close();
+		expect(config.onError).not.toHaveBeenCalled();
+	});
+
+	it('does not upload remote normalization or object-key ordering changes', async () => {
+		const { client, store, persister, state } = await setup();
+		await persister.startAutoSave();
+		const remote = client.rows.get('todos')?.get('row-1') as RemoteRow;
+		client.rows.get('todos')?.set('row-1', {
+			...Object.fromEntries(Object.entries(remote).reverse()),
+			nullable: null,
+			updated_at: client.nextUpdatedAt(),
+		});
+
+		const upload = jest
+			.spyOn(StandardTransport.prototype, 'upsert')
+			.mockRejectedValue({ message: 'Unexpected remote echo', code: '42501' });
+		await persister.syncNow();
+		await persister.save();
+		await persister.syncNow();
+		try {
+			expect(upload).not.toHaveBeenCalled();
+			expect(store.getCell('todos', 'row-1', 'title')).toBe('initial');
+			expect(await state.getOperations()).toEqual([]);
+			expect(await state.getRejected()).toEqual([]);
+		} finally {
+			upload.mockRestore();
+			state.close();
+			await persister.destroy();
+		}
+	});
+
+	it('applies the receiving schema without echoing filtered remote cells', async () => {
+		const { client, store, persister, state } = await setup();
+		persister.getStore().setTablesSchema({ todos: { title: { type: 'string' } } });
+		await persister.save();
+		await persister.syncNow();
+		const remote = client.rows.get('todos')?.get('row-1') as RemoteRow;
+		client.rows.get('todos')?.set('row-1', {
+			...remote,
+			title: 'schema remote',
+			ignored: true,
+			updated_at: client.nextUpdatedAt(),
+		});
+
+		const upload = jest
+			.spyOn(StandardTransport.prototype, 'upsert')
+			.mockRejectedValue({ message: 'Unexpected schema echo', code: '42501' });
+		await persister.syncNow();
+		await persister.save();
+		await persister.syncNow();
+		try {
+			expect(upload).not.toHaveBeenCalled();
+			expect(store.getRow('todos', 'row-1')).toEqual({ title: 'schema remote' });
+		} finally {
+			upload.mockRestore();
+			state.close();
+			await persister.destroy();
+		}
+	});
+
+	it('waits for remote application while a persistence action is queued', async () => {
+		const { client, store, persister, state } = await setup();
+		const entered = gate();
+		const release = gate();
+		const scheduled = persister.schedule(async () => {
+			entered.release();
+			await release.promise;
+		});
+
+		await entered.promise;
+		const saving = persister.save();
+		client.rows.get('todos')?.set('row-2', {
+			id: 'row-2',
+			title: 'remote',
+			deleted_at: null,
+			updated_at: client.nextUpdatedAt(),
+		});
+
+		let complete = false;
+		const syncing = persister.syncNow().then(() => {
+			complete = true;
+			expect(store.getCell('todos', 'row-2', 'title')).toBe('remote');
+		});
+
+		// A transport/storage gate proves the pull reached its application boundary.
+		const original = LocalState.prototype.replaceContent;
+		const replaced = gate();
+		const spy = jest
+			.spyOn(LocalState.prototype, 'replaceContent')
+			.mockImplementationOnce(async function (this: LocalState, ...args) {
+				const result = await original.apply(this, args);
+				replaced.release();
+				return result;
+			});
+
+		await replaced.promise;
+		release.release();
+		await Promise.all([scheduled, saving, syncing]);
+		spy.mockRestore();
+		try {
+			expect(complete).toBe(true);
+			store.setCell('todos', 'row-2', 'title', 'local after sync');
+			await persister.save();
+			expect((await state.getContent())?.[0].todos?.['row-2']?.title).toBe(
+				'local after sync',
+			);
+			await persister.syncNow();
+		} finally {
+			state.close();
+			await persister.destroy();
+		}
+	});
+});
+
 describe('createSupabasePersister', () => {
 	it('normalizes an upgrade that closes IndexedDB during initialization', async () => {
 		const databaseName = `initialization-upgrade-${crypto.randomUUID()}`;
@@ -205,9 +852,11 @@ describe('createSupabasePersister', () => {
 		const readStarted = new Promise<void>((resolve) => {
 			reportReadStarted = resolve;
 		});
+
 		const readGate = new Promise<void>((resolve) => {
 			releaseRead = resolve;
 		});
+
 		const originalGetContent = LocalState.prototype.getContent;
 		const getContent = jest
 			.spyOn(LocalState.prototype, 'getContent')
@@ -216,6 +865,7 @@ describe('createSupabasePersister', () => {
 				await readGate;
 				return originalGetContent.call(this);
 			});
+
 		let futureDatabase: Awaited<ReturnType<typeof openDB>> | undefined;
 		try {
 			const creation = createSupabasePersister(
@@ -235,6 +885,7 @@ describe('createSupabasePersister', () => {
 				currentVersion: 2,
 				requestedVersion: 3,
 			});
+
 			await expect(persister.save()).rejects.toBe(terminalError);
 			await persister.destroy();
 		} finally {
@@ -252,9 +903,11 @@ describe('createSupabasePersister', () => {
 		const readStarted = new Promise<void>((resolve) => {
 			reportReadStarted = resolve;
 		});
+
 		const readGate = new Promise<void>((resolve) => {
 			releaseRead = resolve;
 		});
+
 		const getContent = jest
 			.spyOn(LocalState.prototype, 'getContent')
 			.mockImplementation(async () => {
@@ -262,6 +915,7 @@ describe('createSupabasePersister', () => {
 				await readGate;
 				throw sentinel;
 			});
+
 		let futureDatabase: Awaited<ReturnType<typeof openDB>> | undefined;
 		try {
 			const creation = createSupabasePersister(
@@ -287,6 +941,7 @@ describe('createSupabasePersister', () => {
 			...configuration(client, databaseName),
 			pollIntervalMs: 5,
 		});
+
 		await persister.startAutoPersisting();
 		expect(client.selectCount).toBeGreaterThan(0);
 		store.setRow('todos', 'persisted', { title: 'Persisted' });
@@ -305,6 +960,7 @@ describe('createSupabasePersister', () => {
 			currentVersion: 2,
 			requestedVersion: 3,
 		});
+
 		expect(statuses.at(-1)?.lastError).toBe(terminalError);
 		expect(statuses.at(-1)?.phase).toBe('error');
 		expect(persister.isAutoSaving()).toBe(false);
@@ -357,6 +1013,7 @@ describe('createSupabasePersister', () => {
 			id: 'todo-1',
 			title: 'Write tests',
 		});
+
 		expect(persister.getSyncStatus()).toMatchObject({
 			pendingCount: 0,
 			phase: 'idle',
@@ -434,6 +1091,7 @@ describe('createSupabasePersister', () => {
 			id: 'forbidden',
 			title: 'Remote authoritative',
 		});
+
 		await restarted.syncNow();
 		expect(restartedStore.getCell('todos', 'forbidden', 'title')).toBe('Remote authoritative');
 
@@ -489,6 +1147,7 @@ describe('createSupabasePersister', () => {
 			title: 'Legacy',
 			updated_at: 'existing application value',
 		});
+
 		expect(store.getCell('todos', 'without-timestamp', 'title')).toBe('No timestamp');
 		client.rows.get('todos')?.delete('legacy');
 		await persister.syncNow();
@@ -530,6 +1189,7 @@ describe('createSupabasePersister', () => {
 			title: 'New',
 			updated_at: client.nextUpdatedAt(),
 		});
+
 		await first.syncNow();
 
 		expect(firstStore.getCell('todos', 'existing', 'title')).toBe('Existing');
@@ -564,6 +1224,7 @@ describe('createSupabasePersister', () => {
 			title: 'Remote',
 			updated_at: client.nextUpdatedAt(),
 		});
+
 		await persister.syncNow();
 		expect(store.hasRow('todos', 'remote')).toBe(true);
 
@@ -573,6 +1234,7 @@ describe('createSupabasePersister', () => {
 			title: 'Remote',
 			updated_at: client.nextUpdatedAt(),
 		});
+
 		await persister.syncNow();
 		expect(store.hasRow('todos', 'remote')).toBe(false);
 		await persister.destroy();
@@ -593,6 +1255,7 @@ describe('createSupabasePersister', () => {
 			...configuration(client, crypto.randomUUID()),
 			pageSize: 1,
 		});
+
 		await persister.startAutoPersisting();
 
 		expect(store.getRowIds('todos')).toEqual(['first', 'second']);
@@ -619,11 +1282,13 @@ describe('createSupabasePersister', () => {
 				}
 			}
 		};
+
 		const store = createStore();
 		const persister = await createSupabasePersister(store, {
 			...configuration(client, crypto.randomUUID()),
 			pageSize: 2,
 		});
+
 		await persister.startAutoPersisting();
 
 		expect(store.getRowIds('todos')).toEqual(['first', 'second', 'third']);
@@ -650,6 +1315,7 @@ describe('createSupabasePersister', () => {
 			...fullPullConfiguration(client, crypto.randomUUID()),
 			pageSize: 10,
 		});
+
 		await persister.startAutoPersisting();
 
 		expect(store.getRowIds('todos')).toHaveLength(5);
@@ -679,6 +1345,7 @@ describe('createSupabasePersister', () => {
 			title: 'Late',
 			updated_at: lateUpdatedAt,
 		});
+
 		await persister.syncNow();
 
 		expect(store.getCell('todos', 'late', 'title')).toBe('Late');
@@ -725,6 +1392,7 @@ describe('createSupabasePersister', () => {
 				todos: { table: 'archived_todos', updatedAtColumn: 'updated_at' },
 			},
 		});
+
 		await second.startAutoPersisting();
 
 		expect(store.getCell('todos', 'archived', 'title')).toBe('Archived');
@@ -754,6 +1422,7 @@ describe('createSupabasePersister', () => {
 				todos: { table: 'todos', updatedAtColumn: 'modified_at' },
 			},
 		});
+
 		await persister.startAutoPersisting();
 
 		expect(store.getRow('todos', 'custom')).toEqual({ title: 'Custom' });
@@ -775,12 +1444,14 @@ describe('createSupabasePersister', () => {
 			retryBaseDelayMs: 60_000,
 			retryMaxDelayMs: 60_000,
 		});
+
 		await persister.startAutoPersisting();
 
 		expect(persister.getSyncStatus()).toMatchObject({
 			lastError: expect.objectContaining({ message: expect.stringContaining('updated_at') }),
 			phase: 'offline',
 		});
+
 		await persister.destroy();
 	});
 
@@ -792,6 +1463,7 @@ describe('createSupabasePersister', () => {
 			retryBaseDelayMs: 5,
 			retryMaxDelayMs: 5,
 		});
+
 		await persister.startAutoPersisting();
 		client.transientError = { message: 'network unavailable', status: 503 };
 
