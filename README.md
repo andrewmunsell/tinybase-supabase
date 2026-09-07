@@ -194,6 +194,11 @@ RLS.
 
 ## Synchronization behavior
 
+Remote pulls preserve newer local edits across all tables. Successful
+synchronization waits for remote application and its IndexedDB commit; responses
+acknowledge or reject only the operation revision actually sent. See the
+[local persistence and completion contract](docs/guide/offline-and-conflicts.md#local-persistence-and-synchronization-completion).
+
 Writes are locally durable once the IndexedDB transaction completes. While
 offline, edits remain optimistic in TinyBase and are queued. Permanent Supabase
 errors such as RLS rejection are retained as rejected operations; inspect them

@@ -20,8 +20,10 @@ export const createShadowStoreBridge = (
 		for (const [rowId, row] of Object.entries(store.getTable(tableId))) {
 			table[rowId] = getMetadataRow(row, tableConfig);
 		}
+
 		initialTables[tableId] = table;
 	}
+
 	shadowStore.setTables(initialTables);
 	store.transaction(() => {
 		for (const [tableId, tableConfig] of Object.entries(config.tables)) {
@@ -45,6 +47,7 @@ export const createShadowStoreBridge = (
 				if (applyingProjection || applyingShadow) {
 					return;
 				}
+
 				const nextTable: Table = {};
 				for (const [rowId, row] of Object.entries(store.getTable(tableId))) {
 					nextTable[rowId] = getMetadataRow(row, tableConfig);
@@ -67,9 +70,11 @@ export const createShadowStoreBridge = (
 									store.delCell(tableId, rowId, cellId);
 								}
 							});
+
 							applyingProjection = false;
 						});
 					}
+
 					if (
 						projection &&
 						Object.entries(projection).some(
@@ -89,7 +94,12 @@ export const createShadowStoreBridge = (
 						});
 					}
 				}
-				shadowStore.setTable(tableId, nextTable);
+
+				if (Object.keys(nextTable).length > 0) {
+					shadowStore.setTable(tableId, nextTable);
+				} else {
+					shadowStore.delTable(tableId);
+				}
 			}),
 		);
 
@@ -98,6 +108,7 @@ export const createShadowStoreBridge = (
 				if (applyingShadow) {
 					return;
 				}
+
 				applyingShadow = true;
 				const shadowTable = shadowStore.getTable(tableId);
 				for (const rowId of store.getRowIds(tableId)) {
@@ -105,9 +116,11 @@ export const createShadowStoreBridge = (
 						store.delRow(tableId, rowId);
 					}
 				}
+
 				for (const [rowId, row] of Object.entries(shadowTable)) {
 					store.setRow(tableId, rowId, { ...row, ...getProjection(tableId, rowId) });
 				}
+
 				applyingShadow = false;
 			}),
 		);
@@ -118,10 +131,12 @@ export const createShadowStoreBridge = (
 			if (destroyed) {
 				return;
 			}
+
 			destroyed = true;
 			for (const listenerId of storeListenerIds) {
 				store.delListener(listenerId);
 			}
+
 			for (const listenerId of shadowListenerIds) {
 				shadowStore.delListener(listenerId);
 			}
